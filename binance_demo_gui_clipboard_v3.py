@@ -485,6 +485,8 @@ class App(tk.Tk):
         self.auto_trade_fee_pct_var = tk.StringVar(value="0.10")
         self.auto_trade_min_net_profit_var = tk.StringVar(value="0.15")
         self.auto_trade_max_spread_var = tk.StringVar(value="0.20")
+        self.auto_trade_max_positions_var = tk.StringVar(value="3")
+        self.auto_trade_capital_per_position_var = tk.StringVar(value="100")
         self.auto_trade_status_var = tk.StringVar(value="Autotrade: OFF")
         self.auto_trade_last_check_var = tk.StringVar(value="Last check: never")
         self.strategy_mode_var = tk.StringVar(value="Mean reversion")
@@ -526,6 +528,7 @@ class App(tk.Tk):
         self.auto_trade_entry_price: Decimal | None = None
         self.auto_trade_entry_qty: Decimal | None = None
         self.auto_trade_entry_fee_estimate_quote = ZERO
+        self.auto_trade_positions: dict[str, dict] = {}
         self.auto_trade_cooldown_until = 0.0
         self.auto_trade_last_status_text = "Autotrade: OFF"
         self.auto_trade_cycle_count = 0
@@ -566,6 +569,7 @@ class App(tk.Tk):
         ):
             variable.trace_add("write", self._on_risk_var_changed)
         self._load_saved_keys()
+        self._load_position_snapshot()
         self._sync_mode_health()
         self._refresh_today_health()
         self._refresh_risk_summary()
@@ -758,6 +762,16 @@ class App(tk.Tk):
         ttk.Label(autotrade, text="Max spread %").grid(row=3, column=2, sticky="e", padx=(16, 8), pady=4)
         tk.Entry(autotrade, textvariable=self.auto_trade_max_spread_var, width=10, font=("Consolas", 10)).grid(
             row=3, column=3, sticky="w", pady=4
+        )
+
+        ttk.Label(autotrade, text="Max positions").grid(row=3, column=4, sticky="e", padx=(16, 8), pady=4)
+        tk.Entry(autotrade, textvariable=self.auto_trade_max_positions_var, width=10, font=("Consolas", 10)).grid(
+            row=3, column=5, sticky="w", pady=4
+        )
+
+        ttk.Label(autotrade, text="USDT/position").grid(row=3, column=6, sticky="e", padx=(16, 8), pady=4)
+        tk.Entry(autotrade, textvariable=self.auto_trade_capital_per_position_var, width=10, font=("Consolas", 10)).grid(
+            row=3, column=7, sticky="w", pady=4
         )
 
         auto_trade_buttons = ttk.Frame(autotrade)
@@ -1141,6 +1155,14 @@ class App(tk.Tk):
     ) -> None:
         if label is not None:
             self.health_position_var.set(f"Position: {label}")
+        elif self.auto_trade_positions:
+            total_cost = sum(
+                decimal_or_zero(item.get("entry_price")) * decimal_or_zero(item.get("qty"))
+                for item in self.auto_trade_positions.values()
+            )
+            self.health_position_var.set(
+                f"Position: {len(self.auto_trade_positions)} open | cost≈{format_decimal(total_cost, 2)} USDT"
+            )
         elif symbol and quantity is not None and quantity > ZERO:
             entry_text = f" | avg={format_decimal(entry_price, 2)}" if entry_price and entry_price > ZERO else ""
             self.health_position_var.set(f"Position: {symbol} | qty={format_decimal(quantity)}{entry_text}")
@@ -1362,6 +1384,19 @@ class App(tk.Tk):
                 "entry_order_id": self.position_entry_order_id,
                 "entry_commission": format_decimal(self.position_entry_commission),
             },
+            "positions": {
+                symbol: {
+                    "entry_price": format_decimal(decimal_or_zero(position.get("entry_price"))),
+                    "qty": format_decimal(decimal_or_zero(position.get("qty"))),
+                    "entry_timestamp": str(position.get("entry_timestamp", "")),
+                    "entry_reason": str(position.get("entry_reason", "")),
+                    "entry_order_id": str(position.get("entry_order_id", "")),
+                    "entry_fee_estimate_quote": format_decimal(
+                        decimal_or_zero(position.get("entry_fee_estimate_quote"))
+                    ),
+                }
+                for symbol, position in sorted(self.auto_trade_positions.items())
+            },
             "health": {
                 "api": self.health_api_var.get(),
                 "orders": self.health_orders_var.get(),
@@ -1376,6 +1411,60 @@ class App(tk.Tk):
         payload = self._position_snapshot_payload()
         with self.journal_lock:
             POSITIONS_JSON_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _load_position_snapshot(self) -> None:
+        if not POSITIONS_JSON_PATH.exists():
+            return
+        try:
+            payload = json.loads(POSITIONS_JSON_PATH.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.after(0, lambda e=exc: self.log_warn(f"Could not load positions.json: {e}"))
+            return
+
+        metrics = payload.get("metrics", {}) if isinstance(payload, dict) else {}
+        try:
+            saved_date = str(metrics.get("today_metrics_date", ""))
+            if saved_date == self.today_metrics_date:
+                self.today_fill_count = int(metrics.get("today_fill_count", 0) or 0)
+                self.today_realized_pnl = decimal_or_zero(metrics.get("today_realized_pnl"))
+                self.consecutive_loss_count = int(metrics.get("consecutive_loss_count", 0) or 0)
+        except Exception:
+            pass
+
+        positions = payload.get("positions", {}) if isinstance(payload, dict) else {}
+        if isinstance(positions, dict):
+            for symbol, position in positions.items():
+                if not isinstance(position, dict):
+                    continue
+                normalized_symbol = str(symbol).strip().upper()
+                entry_price = decimal_or_zero(position.get("entry_price"))
+                qty = decimal_or_zero(position.get("qty"))
+                if not normalized_symbol or entry_price <= ZERO or qty <= ZERO:
+                    continue
+                self.auto_trade_positions[normalized_symbol] = {
+                    "entry_price": entry_price,
+                    "qty": qty,
+                    "entry_timestamp": str(position.get("entry_timestamp", "")),
+                    "entry_reason": str(position.get("entry_reason", "Restored from positions.json")),
+                    "entry_order_id": str(position.get("entry_order_id", "")),
+                    "entry_fee_estimate_quote": decimal_or_zero(position.get("entry_fee_estimate_quote")),
+                }
+
+        if self.auto_trade_positions:
+            first_symbol, first_position = next(iter(self.auto_trade_positions.items()))
+            self.auto_trade_entry_price = decimal_or_zero(first_position.get("entry_price"))
+            self.auto_trade_entry_qty = decimal_or_zero(first_position.get("qty"))
+            self.position_entry_timestamp = str(first_position.get("entry_timestamp", ""))
+            self.position_entry_reason = str(first_position.get("entry_reason", "Restored from positions.json"))
+            self.position_entry_order_id = str(first_position.get("entry_order_id", ""))
+            self.auto_trade_entry_fee_estimate_quote = decimal_or_zero(first_position.get("entry_fee_estimate_quote"))
+            self.after(
+                0,
+                lambda count=len(self.auto_trade_positions): self.log_warn(
+                    f"Restored {count} autotrade position(s) from positions.json."
+                ),
+            )
+            self.after(0, lambda: self._update_health_position(label=None))
 
     def _append_jsonl(self, path: Path, payload: dict) -> None:
         with self.journal_lock:
@@ -1767,6 +1856,15 @@ class App(tk.Tk):
             self.position_entry_timestamp = self.position_entry_timestamp or datetime.now().isoformat(timespec="seconds")
             if not self.position_entry_reason:
                 self.position_entry_reason = "User stream sync"
+            if average_price > ZERO:
+                self.auto_trade_positions[symbol] = {
+                    "entry_price": average_price,
+                    "qty": cumulative_qty,
+                    "entry_timestamp": datetime.now().isoformat(timespec="seconds"),
+                    "entry_reason": self.position_entry_reason,
+                    "entry_order_id": order_id,
+                    "entry_fee_estimate_quote": ZERO,
+                }
             if symbol == self.symbol_var.get().strip().upper():
                 self._update_health_position(symbol, cumulative_qty, self.auto_trade_entry_price)
 
@@ -1787,8 +1885,9 @@ class App(tk.Tk):
             self.position_entry_reason = ""
             self.position_entry_order_id = ""
             self.position_entry_commission = ZERO
+            self.auto_trade_positions.pop(symbol, None)
             if symbol == self.symbol_var.get().strip().upper():
-                self._update_health_position(label="flat")
+                self._update_health_position(label=None)
 
         if subscription_id is not None:
             self.health_user_ws_var.set(f"User WS: live | subscription={subscription_id} | last={execution_type}/{status}")
@@ -2054,6 +2153,10 @@ class App(tk.Tk):
             "round_trip_fee_pct": fee_pct * Decimal("2"),
             "min_net_profit_pct": min_net_profit_pct,
             "max_spread_pct": max_spread_pct,
+            "max_positions": self._validate_int_field(self.auto_trade_max_positions_var.get(), "Max positions", minimum=1),
+            "capital_per_position": self._validate_decimal_field(
+                self.auto_trade_capital_per_position_var.get(), "USDT/position"
+            ),
             "strategy_mode": self._validate_strategy_mode(),
             "execution_mode": self._validate_execution_mode(),
         }
@@ -2317,6 +2420,7 @@ class App(tk.Tk):
             self.position_entry_order_id = ""
             self.position_entry_commission = ZERO
             self.auto_trade_entry_fee_estimate_quote = ZERO
+            self.auto_trade_positions.clear()
         self.auto_trade_cooldown_until = 0.0
         if clear_history:
             self.auto_trade_price_history.clear()
@@ -2372,6 +2476,34 @@ class App(tk.Tk):
         exit_fee = exit_price * quantity * config["fee_pct"] / Decimal("100")
         return gross - entry_fee - exit_fee, entry_fee, exit_fee
 
+    def _quantity_for_capital(
+        self,
+        client: BinanceDemoClient,
+        symbol: str,
+        entry_price: Decimal,
+        capital: Decimal,
+    ) -> str:
+        if entry_price <= ZERO:
+            raise BinanceDemoError("Entry price must be greater than zero.")
+        symbol_info = client.get_exchange_info(symbol)
+        qty_filter = self._quantity_filter_for_order(symbol_info, "MARKET")
+        step_size = decimal_or_zero(qty_filter.get("stepSize")) if qty_filter else ZERO
+        min_qty = decimal_or_zero(qty_filter.get("minQty")) if qty_filter else ZERO
+        max_qty = decimal_or_zero(qty_filter.get("maxQty")) if qty_filter else ZERO
+        qty = capital / entry_price
+        if max_qty > ZERO:
+            qty = min(qty, max_qty)
+        if step_size > ZERO:
+            qty = round_step_down(qty, step_size)
+        if qty <= ZERO:
+            raise BinanceDemoError(f"Capital per position is too small for {symbol}.")
+        if min_qty > ZERO and qty < min_qty:
+            raise BinanceDemoError(
+                f"Capital per position gives qty {format_decimal(qty)} below minQty {format_decimal(min_qty)} for {symbol}."
+            )
+        self._validate_notional_filters(symbol_info, qty * entry_price, is_market=True)
+        return format_decimal(qty)
+
     def _auto_trade_history_for(self, symbol: str) -> list[Decimal]:
         symbol = symbol.upper()
         history = self.auto_trade_price_histories.setdefault(symbol, [])
@@ -2390,6 +2522,18 @@ class App(tk.Tk):
 
     def _select_auto_trade_candidate(self, client: BinanceDemoClient, config: dict) -> dict:
         symbols = config["scan_symbols"] if config["auto_select"] else [self.symbol_var.get().strip().upper()]
+        candidates = self._scan_auto_trade_candidates(client, config, symbols)
+        for candidate in candidates:
+            if candidate["ready"] and not candidate["blocked_reason"]:
+                return candidate
+        return candidates[0]
+
+    def _scan_auto_trade_candidates(
+        self,
+        client: BinanceDemoClient,
+        config: dict,
+        symbols: list[str],
+    ) -> list[dict]:
         if not symbols or not symbols[0]:
             raise BinanceDemoError("Set a symbol before enabling autotrade.")
 
@@ -2441,11 +2585,9 @@ class App(tk.Tk):
         )
         if top_text:
             self.after(0, lambda text=top_text: self.log_info(f"[AUTO-TRADE] scan top: {text}"))
-
-        for candidate in candidates:
-            if candidate["ready"] and not candidate["blocked_reason"]:
-                return candidate
-        return candidates[0]
+        if not candidates:
+            raise BinanceDemoError("No autotrade scan candidates were available.")
+        return candidates
 
     def _evaluate_price_trigger(self, bid: Decimal, ask: Decimal, trigger_config: dict) -> tuple[bool, Decimal, str]:
         market_field = trigger_config["market_field"]
@@ -2491,6 +2633,14 @@ class App(tk.Tk):
         self.position_entry_reason = reason
         self.position_entry_order_id = buy_order_id
         self.position_entry_commission = commission_amount
+        self.auto_trade_positions[symbol] = {
+            "entry_price": self.auto_trade_entry_price,
+            "qty": entry_qty,
+            "entry_timestamp": self.position_entry_timestamp,
+            "entry_reason": reason,
+            "entry_order_id": buy_order_id,
+            "entry_fee_estimate_quote": ZERO,
+        }
 
         self._journal_order_event("order_update", symbol, reason, order, {"side": "BUY"})
         self._journal_trade_fill(symbol, "BUY", "entry", reason, order)
@@ -2522,14 +2672,19 @@ class App(tk.Tk):
             executed_qty = decimal_or_zero(requested_qty)
         exit_price = self._extract_average_fill_price(order, fallback_price)
         matched_qty = executed_qty
-        if self.auto_trade_entry_qty and self.auto_trade_entry_qty > ZERO:
-            matched_qty = min(self.auto_trade_entry_qty, executed_qty)
+        portfolio_position = self.auto_trade_positions.get(symbol, {})
+        portfolio_entry_qty = decimal_or_zero(portfolio_position.get("qty"))
+        portfolio_entry_price = decimal_or_zero(portfolio_position.get("entry_price"))
+        entry_qty_for_pnl = portfolio_entry_qty if portfolio_entry_qty > ZERO else self.auto_trade_entry_qty
+        entry_price_for_pnl = portfolio_entry_price if portfolio_entry_price > ZERO else self.auto_trade_entry_price
+        if entry_qty_for_pnl and entry_qty_for_pnl > ZERO:
+            matched_qty = min(entry_qty_for_pnl, executed_qty)
         realized_pnl = ZERO
-        if self.auto_trade_entry_price and self.auto_trade_entry_price > ZERO and matched_qty > ZERO:
-            realized_pnl = (exit_price * matched_qty) - (self.auto_trade_entry_price * matched_qty)
+        if entry_price_for_pnl and entry_price_for_pnl > ZERO and matched_qty > ZERO:
+            realized_pnl = (exit_price * matched_qty) - (entry_price_for_pnl * matched_qty)
             if fee_config is not None:
                 realized_pnl, _entry_fee_estimate, _exit_fee_estimate = self._auto_trade_estimated_net_pnl(
-                    self.auto_trade_entry_price,
+                    entry_price_for_pnl,
                     exit_price,
                     matched_qty,
                     fee_config,
@@ -2546,10 +2701,11 @@ class App(tk.Tk):
         self.position_entry_order_id = ""
         self.position_entry_commission = ZERO
         self.auto_trade_entry_fee_estimate_quote = ZERO
+        self.auto_trade_positions.pop(symbol, None)
 
         self.after(0, lambda oid=sell_order_id: self._set_last_order_id(oid))
         self.after(0, lambda qty=format_decimal(executed_qty): self.quantity_var.set(qty))
-        self.after(0, lambda: self._update_health_position(label="flat"))
+        self.after(0, lambda: self._update_health_position(label=None))
         sign = "+" if realized_pnl >= ZERO else ""
         fill_text = (
             f"SELL {symbol} | qty={format_decimal(executed_qty)} | avg={format_decimal(exit_price, 2)} | "
@@ -2645,6 +2801,49 @@ class App(tk.Tk):
             "locked_qty": decimal_or_zero(base_balance.get("locked") if base_balance else "0"),
             "quote_free": decimal_or_zero(quote_balance.get("free") if quote_balance else "0"),
         }
+
+    def _sync_existing_auto_trade_positions(self, client: BinanceDemoClient, symbols: list[str]) -> int:
+        synced = 0
+        for symbol in symbols:
+            try:
+                position = self._position_balance_for_symbol(client, symbol)
+            except Exception as exc:
+                self.after(0, lambda s=symbol, e=exc: self.log_warn(f"[AUTO-TRADE] Balance sync skipped {s}: {e}"))
+                continue
+            if position["free_qty"] <= ZERO:
+                continue
+            existing_position = self.auto_trade_positions.get(symbol)
+            if existing_position:
+                existing_position["qty"] = position["free_qty"]
+                synced += 1
+                continue
+            try:
+                book = client.get_book_ticker(symbol)
+                _, _, mid = self._market_prices(book)
+            except Exception:
+                mid = ZERO
+            entry_price = mid if mid > ZERO else Decimal("0")
+            self.auto_trade_positions[symbol] = {
+                "entry_price": entry_price,
+                "qty": position["free_qty"],
+                "entry_timestamp": datetime.now().isoformat(timespec="seconds"),
+                "entry_reason": "Autotrade balance sync",
+                "entry_order_id": "",
+                "entry_fee_estimate_quote": ZERO,
+            }
+            if self.auto_trade_entry_price is None:
+                self.auto_trade_entry_price = entry_price
+                self.auto_trade_entry_qty = position["free_qty"]
+                self.position_entry_reason = "Autotrade balance sync"
+                self.position_entry_timestamp = datetime.now().isoformat(timespec="seconds")
+            synced += 1
+            self.after(
+                0,
+                lambda s=symbol, qty=position["free_qty"], px=entry_price, asset=position["base_asset"]: self.log_warn(
+                    f"Autotrade synced existing {asset} balance on {s}: qty={format_decimal(qty)} | basis≈{format_decimal(px, 2)}."
+                ),
+            )
+        return synced
 
     def _extract_filter_value(self, symbol_info: dict, filter_type: str, key: str, default: str = "0") -> Decimal:
         for item in symbol_info.get("filters", []):
@@ -2891,6 +3090,14 @@ class App(tk.Tk):
             self.position_entry_order_id = str(result.get("orderId", ""))
             self.position_entry_reason = self.position_entry_reason or "Manual status sync"
             self.position_entry_timestamp = self.position_entry_timestamp or datetime.now().isoformat(timespec="seconds")
+            self.auto_trade_positions[symbol] = {
+                "entry_price": entry_price,
+                "qty": executed_qty,
+                "entry_timestamp": self.position_entry_timestamp,
+                "entry_reason": self.position_entry_reason,
+                "entry_order_id": self.position_entry_order_id,
+                "entry_fee_estimate_quote": ZERO,
+            }
             self.after(0, lambda s=symbol, qty=executed_qty, px=entry_price: self._update_health_position(s, qty, px))
         elif side == "SELL" and status == "FILLED":
             self.auto_trade_entry_price = None
@@ -2899,7 +3106,8 @@ class App(tk.Tk):
             self.position_entry_reason = ""
             self.position_entry_order_id = ""
             self.position_entry_commission = ZERO
-            self.after(0, lambda: self._update_health_position(label="flat"))
+            self.auto_trade_positions.pop(symbol, None)
+            self.after(0, lambda: self._update_health_position(label=None))
         self.after(0, lambda: self.log_ok(f"Статус ордера: {self._format_order_summary(result)}"))
         self.after(0, lambda: self.log_block("Полный ответ Binance по статусу ордера", result))
         self.after(0, lambda: self._apply_pnl_snapshot(snapshot, auto=False))
@@ -3111,29 +3319,21 @@ class App(tk.Tk):
                 if not symbol:
                     raise BinanceDemoError("Set a symbol before enabling autotrade.")
 
-                self._clear_auto_trade_runtime(clear_history=True, clear_position_basis=True)
+                self._clear_auto_trade_runtime(clear_history=True, clear_position_basis=False)
                 self.auto_trade_cycle_count = 0
-                position = self._position_balance_for_symbol(client, symbol)
+                sync_symbols = config["scan_symbols"] if config["auto_select"] else [symbol]
                 self._sync_mode_health()
                 self._set_health_api("connected")
                 self._update_health_orders(0, symbol)
                 self._ensure_demo_streams()
-                if position["free_qty"] > ZERO:
-                    book = client.get_book_ticker(symbol)
-                    _, _, mid = self._market_prices(book)
-                    self.auto_trade_entry_price = mid
-                    self.auto_trade_entry_qty = position["free_qty"]
-                    self.position_entry_reason = "Autotrade balance sync"
-                    self.position_entry_timestamp = datetime.now().isoformat(timespec="seconds")
-                    self.after(0, lambda qty=position["free_qty"], px=mid, s=symbol: self._update_health_position(s, qty, px))
-                    self.log_warn(
-                        f"Autotrade found an existing {position['base_asset']} balance. Basis is set to current mid {format_decimal(mid, 2)}."
-                    )
+                synced_count = self._sync_existing_auto_trade_positions(client, sync_symbols)
+                if synced_count:
+                    self.after(0, lambda: self._update_health_position(label=None))
                 else:
                     self.after(0, lambda: self._update_health_position(label="flat"))
 
                 self._set_auto_trade_status(
-                    f"Autotrade armed: {symbol} | {config['strategy_mode']} | {config['execution_mode']} | every {config['interval_seconds']}s",
+                    f"Autotrade armed: {symbol} | {config['strategy_mode']} | {config['execution_mode']} | positions {len(self.auto_trade_positions)}/{config['max_positions']} | every {config['interval_seconds']}s",
                     PNL_COLOR_NEUTRAL,
                     log_level="info",
                 )
@@ -3147,7 +3347,8 @@ class App(tk.Tk):
                     self.log_warn(
                         f"Autotrade mean reversion uses MARKET BUY / MARKET SELL on the Binance demo API. "
                         f"Mode={mode_text} | fee={format_decimal(config['fee_pct'], 3)}%/side | "
-                        f"min net={format_decimal(config['min_net_profit_pct'], 2)}% | max spread={format_decimal(config['max_spread_pct'], 3)}%. Demo only."
+                        f"min net={format_decimal(config['min_net_profit_pct'], 2)}% | max spread={format_decimal(config['max_spread_pct'], 3)}% | "
+                        f"max positions={config['max_positions']} | capital/position={format_decimal(config['capital_per_position'], 2)} USDT. Demo only."
                     )
                 self._set_auto_trade_last_check("Last check: waiting for first cycle", PNL_COLOR_NEUTRAL)
                 self._schedule_next_auto_trade(initial=True)
@@ -3223,6 +3424,213 @@ class App(tk.Tk):
         threading.Thread(target=runner, daemon=True).start()
 
     def _auto_trade_cycle_impl(self) -> None:
+        return self._auto_trade_portfolio_cycle_impl()
+
+    def _auto_trade_portfolio_cycle_impl(self) -> None:
+        client = self._client()
+        config = self._validate_auto_trade_config()
+        strategy_mode = config["strategy_mode"]
+        execution_mode = config["execution_mode"]
+        now_ts = time.time()
+        self.after(0, lambda: self._set_health_api("connected"))
+
+        scan_symbols = config["scan_symbols"] if config["auto_select"] else [self.symbol_var.get().strip().upper()]
+        scan_symbols = [symbol for symbol in scan_symbols if symbol]
+        if not scan_symbols:
+            raise BinanceDemoError("Set at least one symbol before enabling autotrade.")
+
+        # Keep existing positions first. This prevents entry scans from hiding exits.
+        portfolio_net = ZERO
+        closed_count = 0
+        open_symbols = list(self.auto_trade_positions.keys())
+        for symbol in open_symbols:
+            position_state = self.auto_trade_positions.get(symbol)
+            if not position_state:
+                continue
+            bid, ask, mid = self._current_market_prices(client, symbol)
+            history, average_mid, dip_pct = self._append_auto_trade_price(symbol, mid, config["window"])
+            spread_pct = self._spread_pct(bid, ask, mid)
+            required_profit_pct = self._auto_trade_required_profit_pct(config, spread_pct)
+            balance = self._position_balance_for_symbol(client, symbol)
+            free_qty = balance["free_qty"]
+            if free_qty <= ZERO:
+                self.auto_trade_positions.pop(symbol, None)
+                self.after(0, lambda s=symbol: self.log_warn(f"[AUTO-TRADE] {s} removed from portfolio: no free balance."))
+                continue
+
+            entry_price = decimal_or_zero(position_state.get("entry_price"))
+            entry_qty = decimal_or_zero(position_state.get("qty"))
+            if entry_price <= ZERO:
+                entry_price = mid
+                position_state["entry_price"] = entry_price
+            if entry_qty <= ZERO:
+                entry_qty = free_qty
+                position_state["qty"] = entry_qty
+
+            pnl_pct = ((bid - entry_price) / entry_price * Decimal("100")) if entry_price > ZERO else ZERO
+            estimated_net_pnl, entry_fee_estimate, exit_fee_estimate = self._auto_trade_estimated_net_pnl(
+                entry_price,
+                bid,
+                min(free_qty, entry_qty),
+                config,
+            )
+            portfolio_net += estimated_net_pnl
+            status_color = PNL_COLOR_PROFIT if estimated_net_pnl > ZERO else PNL_COLOR_LOSS if estimated_net_pnl < ZERO else PNL_COLOR_NEUTRAL
+            self._publish_auto_trade_heartbeat("hold", symbol, mid, average_mid, dip_pct, status_color)
+            self.after(
+                0,
+                lambda s=symbol, qty=free_qty, entry=entry_price, b=bid, pct=pnl_pct, net=estimated_net_pnl, need=required_profit_pct: self.log_pnl(
+                    f"[AUTO-TRADE] {s} HOLD qty={format_decimal(qty)} | entry={format_decimal(entry, 2)} | bid={format_decimal(b, 2)} | gross={format_decimal(pct, 2)}% | net≈{format_decimal(net, 2)} | target={format_decimal(need, 2)}%",
+                    net,
+                ),
+            )
+
+            exit_reason = ""
+            if pnl_pct >= required_profit_pct and estimated_net_pnl > ZERO:
+                exit_reason = "fee-aware take-profit"
+            elif pnl_pct <= -config["stop_loss_pct"]:
+                exit_reason = "stop-loss"
+            if not exit_reason:
+                continue
+
+            open_orders = client.get_open_orders(symbol=symbol)
+            self.after(0, lambda count=len(open_orders), s=symbol: self._update_health_orders(count, s))
+            if open_orders:
+                self.after(0, lambda s=symbol, count=len(open_orders): self.log_warn(f"[AUTO-TRADE] {s} exit paused: {count} open order(s)."))
+                continue
+
+            sell_qty, base_asset, details = self._sellable_quantity_for_symbol(client, symbol)
+            self._validate_order_filters(client, symbol, sell_qty, "SELL", "MARKET")
+            if execution_mode == "Manual":
+                self.after(
+                    0,
+                    lambda reason=exit_reason, s=symbol, qty=sell_qty, asset=base_asset: self.log_warn(
+                        f"[AUTO-TRADE] EXIT signal only ({reason}): {s} | qty={qty} {asset}"
+                    ),
+                )
+                continue
+
+            if execution_mode == "Test first":
+                self._run_test_market_order(client, symbol, "SELL", sell_qty)
+            result = client.market_sell(symbol=symbol, quantity=sell_qty)
+            result = self._refresh_order_snapshot(client, symbol, result)
+            self._journal_order_event("order_submit", symbol, f"Autotrade {exit_reason} sell", result)
+            exit_price, executed_qty, realized_pnl, _sell_order_id = self._record_exit_fill(
+                symbol,
+                f"Autotrade {exit_reason} sell",
+                result,
+                bid,
+                sell_qty,
+                fee_config=config,
+            )
+            closed_count += 1
+            self.auto_trade_cooldown_until = now_ts + config["cooldown_seconds"]
+            self.after(
+                0,
+                lambda reason=exit_reason, s=symbol, qty=executed_qty, asset=base_asset, px=exit_price, pnl=realized_pnl: self.log_ok(
+                    f"[AUTO-TRADE] SELL {reason}: {s} | qty={format_decimal(qty)} {asset} | avg={format_decimal(px, 2)} | net realized≈{format_decimal(pnl, 2)}"
+                ),
+            )
+            self.after(0, lambda payload=result: self.log_block("[AUTO-TRADE] Binance AUTO SELL response", payload))
+
+        if now_ts < self.auto_trade_cooldown_until:
+            remaining = int(max(0, self.auto_trade_cooldown_until - now_ts))
+            self.after(
+                0,
+                lambda rem=remaining, count=len(self.auto_trade_positions), net=portfolio_net: self._set_auto_trade_status(
+                    f"Autotrade portfolio cooldown {rem}s | open={count} | net≈{format_decimal(net, 2)}",
+                    PNL_COLOR_WARNING,
+                ),
+            )
+            self.after(0, lambda: self._update_health_position(label=None))
+            return
+
+        candidates = self._scan_auto_trade_candidates(client, config, scan_symbols)
+        entries_left = max(0, config["max_positions"] - len(self.auto_trade_positions))
+        opened_count = 0
+        if strategy_mode == "Price trigger":
+            candidates = [item for item in candidates if item["symbol"] == self.symbol_var.get().strip().upper()]
+
+        for candidate in candidates:
+            if entries_left <= 0:
+                break
+            symbol = candidate["symbol"]
+            if symbol in self.auto_trade_positions:
+                continue
+            if candidate["blocked_reason"] or not candidate["ready"]:
+                continue
+            open_orders = client.get_open_orders(symbol=symbol)
+            if open_orders:
+                self.after(0, lambda s=symbol, count=len(open_orders): self.log_warn(f"[AUTO-TRADE] {s} entry skipped: {count} open order(s)."))
+                continue
+
+            bid = candidate["bid"]
+            ask = candidate["ask"]
+            mid = candidate["mid"]
+            average_mid = candidate["average_mid"]
+            dip_pct = candidate["dip_pct"]
+            spread_pct = candidate["spread_pct"]
+            required_profit_pct = self._auto_trade_required_profit_pct(config, spread_pct)
+
+            if strategy_mode == "Price trigger":
+                trigger_config = config["price_trigger"]
+                triggered, trigger_price, trigger_text = self._evaluate_price_trigger(bid, ask, trigger_config)
+                if not triggered:
+                    continue
+                signal_reason = f"Price trigger hit: {trigger_text} | current={format_decimal(trigger_price, 2)}"
+            else:
+                if dip_pct < config["buy_threshold_pct"]:
+                    continue
+                signal_reason = (
+                    f"Mean reversion buy: dip {format_decimal(dip_pct, 2)}% below SMA | "
+                    f"spread {format_decimal(spread_pct, 3)}% | target net-aware {format_decimal(required_profit_pct, 2)}%"
+                )
+
+            self._enforce_risk_limits(client, symbol)
+            quantity = (
+                self._resolve_buy_quantity(client, symbol, "MARKET", apply_risk_to_field=not config["auto_select"])
+                if self.use_risk_sizing_var.get()
+                else self._quantity_for_capital(client, symbol, ask, config["capital_per_position"])
+            )
+            self._validate_order_filters(client, symbol, quantity, "BUY", "MARKET")
+
+            if execution_mode == "Manual":
+                self.after(0, lambda s=symbol, reason=signal_reason, q=quantity: self.log_warn(f"[AUTO-TRADE] ENTRY signal only: {s} | {reason} | qty={q}"))
+                entries_left -= 1
+                continue
+            if execution_mode == "Test first":
+                self._run_test_market_order(client, symbol, "BUY", quantity)
+
+            result = client.market_buy(symbol=symbol, quantity=quantity)
+            result = self._refresh_order_snapshot(client, symbol, result)
+            self._journal_order_event("order_submit", symbol, signal_reason, result)
+            entry_price, entry_qty, buy_order_id = self._record_entry_fill(symbol, signal_reason, result, ask, quantity)
+            fee_estimate = entry_price * entry_qty * config["fee_pct"] / Decimal("100")
+            if symbol in self.auto_trade_positions:
+                self.auto_trade_positions[symbol]["entry_fee_estimate_quote"] = fee_estimate
+            opened_count += 1
+            entries_left -= 1
+            self.after(
+                0,
+                lambda s=symbol, q=entry_qty, px=entry_price, reason=signal_reason, fee=fee_estimate, target=required_profit_pct: self.log_ok(
+                    f"[AUTO-TRADE] BUY executed: {s} | {reason} | qty={format_decimal(q)} | avg={format_decimal(px, 2)} | entry fee≈{format_decimal(fee, 2)} | exit target={format_decimal(target, 2)}%"
+                ),
+            )
+            self.after(0, lambda payload=result: self.log_block("[AUTO-TRADE] Binance AUTO BUY response", payload))
+
+        color = PNL_COLOR_PROFIT if portfolio_net > ZERO else PNL_COLOR_LOSS if portfolio_net < ZERO else PNL_COLOR_NEUTRAL
+        self.after(
+            0,
+            lambda open_count=len(self.auto_trade_positions), opened=opened_count, closed=closed_count, net=portfolio_net: self._set_auto_trade_status(
+                f"Autotrade portfolio | open={open_count}/{config['max_positions']} | opened={opened} | closed={closed} | net≈{format_decimal(net, 2)}",
+                color,
+            ),
+        )
+        self.after(0, lambda: self._update_health_position(label=None))
+        self.after(0, self._write_position_snapshot)
+        return
+
+        # Legacy single-position implementation is kept below as a fallback reference.
         client = self._client()
         config = self._validate_auto_trade_config()
         symbol = self.symbol_var.get().strip().upper()
@@ -3417,7 +3825,7 @@ class App(tk.Tk):
         self.position_entry_order_id = ""
         self.position_entry_commission = ZERO
         self.auto_trade_entry_fee_estimate_quote = ZERO
-        self.after(0, lambda: self._update_health_position(label="flat"))
+        self.after(0, lambda: self._update_health_position(label=None))
 
         if now_ts < self.auto_trade_cooldown_until:
             remaining = int(max(0, self.auto_trade_cooldown_until - now_ts))

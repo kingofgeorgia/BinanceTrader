@@ -8,6 +8,7 @@ A desktop GUI for Binance Demo trading. The app lets you connect with Binance De
 - Binance Demo REST API integration
 - Binance Demo WebSocket support
 - Market, limit, stop-loss, and take-profit order workflows
+- Fee-aware multi-position autotrade scanner for selected USDT pairs
 - Local order and position persistence
 - CSV trade journal export
 
@@ -41,6 +42,22 @@ Then edit `binance_demo_keys.json` and add your Binance Demo API key and secret.
 ```powershell
 python binance_demo_gui_clipboard_v3.py
 ```
+
+## Autotrade
+
+Autotrade can scan multiple USDT pairs and keep several positions open at the same time.
+
+Key controls:
+
+- `Auto-select`: scans the configured symbol list and chooses candidates automatically.
+- `Scan symbols`: comma-separated USDT pairs to scan.
+- `Max positions`: maximum simultaneous autotrade positions.
+- `USDT/position`: quote amount to allocate to each new position when risk sizing is off.
+- `Fee %`: estimated fee per side.
+- `Min net %`: extra target profit after estimated fees and spread.
+- `Max spread %`: skips pairs with a wider spread.
+
+The bot saves portfolio state in `positions.json` and restores it on startup. It still cannot guarantee profit; market moves, slippage, liquidity, and API behavior can produce losses.
 
 ## Local Data
 
