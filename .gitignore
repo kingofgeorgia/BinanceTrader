@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+
+# Local credentials and runtime state
+binance_demo_keys.json
+orders.jsonl
+positions.json
+trades.csv
+
+# Local editor/system noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
