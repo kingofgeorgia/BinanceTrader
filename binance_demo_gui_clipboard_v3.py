@@ -110,6 +110,9 @@ class BinanceDemoClient:
     def get_book_ticker(self, symbol: str) -> dict:
         return self._request("GET", "/v3/ticker/bookTicker", {"symbol": symbol.upper()})
 
+    def get_all_book_tickers(self) -> list:
+        return self._request("GET", "/v3/ticker/bookTicker")
+
     def get_open_orders(self, symbol: str | None = None) -> list:
         params = {"symbol": symbol.upper()} if symbol else {}
         return self._request("GET", "/v3/openOrders", params, signed=True)
@@ -477,6 +480,11 @@ class App(tk.Tk):
         self.auto_trade_take_profit_var = tk.StringVar(value="0.50")
         self.auto_trade_stop_loss_var = tk.StringVar(value="0.35")
         self.auto_trade_cooldown_var = tk.StringVar(value="30")
+        self.auto_trade_auto_select_var = tk.BooleanVar(value=True)
+        self.auto_trade_scan_symbols_var = tk.StringVar(value="BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,DOGEUSDT")
+        self.auto_trade_fee_pct_var = tk.StringVar(value="0.10")
+        self.auto_trade_min_net_profit_var = tk.StringVar(value="0.15")
+        self.auto_trade_max_spread_var = tk.StringVar(value="0.20")
         self.auto_trade_status_var = tk.StringVar(value="Autotrade: OFF")
         self.auto_trade_last_check_var = tk.StringVar(value="Last check: never")
         self.strategy_mode_var = tk.StringVar(value="Mean reversion")
@@ -514,8 +522,10 @@ class App(tk.Tk):
         self.auto_trade_job = None
         self.auto_trade_in_flight = False
         self.auto_trade_price_history: list[Decimal] = []
+        self.auto_trade_price_histories: dict[str, list[Decimal]] = {}
         self.auto_trade_entry_price: Decimal | None = None
         self.auto_trade_entry_qty: Decimal | None = None
+        self.auto_trade_entry_fee_estimate_quote = ZERO
         self.auto_trade_cooldown_until = 0.0
         self.auto_trade_last_status_text = "Autotrade: OFF"
         self.auto_trade_cycle_count = 0
@@ -721,11 +731,37 @@ class App(tk.Tk):
 
         ttk.Label(
             autotrade,
-            text="Strategy: MARKET BUY when mid price drops below SMA. MARKET SELL on take-profit or stop-loss. Demo only.",
+            text="Strategy: auto-select scans symbols, buys dips below SMA, and sells only when target covers fees/spread buffer. Demo only.",
         ).grid(row=1, column=4, columnspan=4, sticky="w", pady=4)
 
+        ttk.Checkbutton(
+            autotrade,
+            text="Auto-select",
+            variable=self.auto_trade_auto_select_var,
+        ).grid(row=2, column=0, sticky="w", pady=4)
+
+        ttk.Label(autotrade, text="Scan symbols").grid(row=2, column=1, sticky="e", padx=(8, 8), pady=4)
+        tk.Entry(autotrade, textvariable=self.auto_trade_scan_symbols_var, width=46, font=("Consolas", 10)).grid(
+            row=2, column=2, columnspan=4, sticky="ew", pady=4
+        )
+
+        ttk.Label(autotrade, text="Fee %").grid(row=2, column=6, sticky="e", padx=(16, 8), pady=4)
+        tk.Entry(autotrade, textvariable=self.auto_trade_fee_pct_var, width=10, font=("Consolas", 10)).grid(
+            row=2, column=7, sticky="w", pady=4
+        )
+
+        ttk.Label(autotrade, text="Min net %").grid(row=3, column=0, sticky="w", padx=(0, 8), pady=4)
+        tk.Entry(autotrade, textvariable=self.auto_trade_min_net_profit_var, width=10, font=("Consolas", 10)).grid(
+            row=3, column=1, sticky="w", pady=4
+        )
+
+        ttk.Label(autotrade, text="Max spread %").grid(row=3, column=2, sticky="e", padx=(16, 8), pady=4)
+        tk.Entry(autotrade, textvariable=self.auto_trade_max_spread_var, width=10, font=("Consolas", 10)).grid(
+            row=3, column=3, sticky="w", pady=4
+        )
+
         auto_trade_buttons = ttk.Frame(autotrade)
-        auto_trade_buttons.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        auto_trade_buttons.grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         self.start_auto_trade_button = ttk.Button(
             auto_trade_buttons,
@@ -748,7 +784,7 @@ class App(tk.Tk):
             anchor="w",
             fg=PNL_COLOR_NEUTRAL,
         )
-        self.auto_trade_status_label.grid(row=2, column=2, columnspan=6, sticky="ew", padx=(16, 0), pady=(10, 0))
+        self.auto_trade_status_label.grid(row=4, column=2, columnspan=6, sticky="ew", padx=(16, 0), pady=(10, 0))
         self.auto_trade_last_check_label = tk.Label(
             autotrade,
             textvariable=self.auto_trade_last_check_var,
@@ -756,7 +792,7 @@ class App(tk.Tk):
             anchor="w",
             fg=PNL_COLOR_NEUTRAL,
         )
-        self.auto_trade_last_check_label.grid(row=3, column=0, columnspan=8, sticky="ew", pady=(8, 0))
+        self.auto_trade_last_check_label.grid(row=5, column=0, columnspan=8, sticky="ew", pady=(8, 0))
         self._sync_auto_trade_buttons()
 
         strategy = ttk.LabelFrame(outer, text="Strategy & Execution", padding=12)
@@ -1983,7 +2019,28 @@ class App(tk.Tk):
             "target": target,
         }
 
+    def _parse_auto_trade_scan_symbols(self) -> list[str]:
+        raw = self.auto_trade_scan_symbols_var.get().replace("\n", ",")
+        symbols: list[str] = []
+        seen: set[str] = set()
+        for item in raw.split(","):
+            symbol = item.strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            if not symbol.endswith("USDT"):
+                raise BinanceDemoError(f"Auto-select supports USDT pairs only: {symbol}.")
+            symbols.append(symbol)
+            seen.add(symbol)
+        if not symbols:
+            raise BinanceDemoError("Add at least one scan symbol for auto-select.")
+        return symbols
+
     def _validate_auto_trade_config(self) -> dict:
+        fee_pct = self._validate_decimal_field(self.auto_trade_fee_pct_var.get(), "Fee %", allow_zero=True)
+        min_net_profit_pct = self._validate_decimal_field(
+            self.auto_trade_min_net_profit_var.get(), "Min net %", allow_zero=True
+        )
+        max_spread_pct = self._validate_decimal_field(self.auto_trade_max_spread_var.get(), "Max spread %")
         config = {
             "interval_seconds": self._validate_int_field(self.auto_trade_interval_var.get(), "Auto interval", minimum=1),
             "window": self._validate_int_field(self.auto_trade_window_var.get(), "SMA window", minimum=3),
@@ -1991,6 +2048,12 @@ class App(tk.Tk):
             "take_profit_pct": self._validate_decimal_field(self.auto_trade_take_profit_var.get(), "Take profit %"),
             "stop_loss_pct": self._validate_decimal_field(self.auto_trade_stop_loss_var.get(), "Stop loss %"),
             "cooldown_seconds": self._validate_int_field(self.auto_trade_cooldown_var.get(), "Cooldown", minimum=0),
+            "auto_select": bool(self.auto_trade_auto_select_var.get()),
+            "scan_symbols": self._parse_auto_trade_scan_symbols(),
+            "fee_pct": fee_pct,
+            "round_trip_fee_pct": fee_pct * Decimal("2"),
+            "min_net_profit_pct": min_net_profit_pct,
+            "max_spread_pct": max_spread_pct,
             "strategy_mode": self._validate_strategy_mode(),
             "execution_mode": self._validate_execution_mode(),
         }
@@ -2253,9 +2316,11 @@ class App(tk.Tk):
             self.position_entry_reason = ""
             self.position_entry_order_id = ""
             self.position_entry_commission = ZERO
+            self.auto_trade_entry_fee_estimate_quote = ZERO
         self.auto_trade_cooldown_until = 0.0
         if clear_history:
             self.auto_trade_price_history.clear()
+            self.auto_trade_price_histories.clear()
 
     def _refresh_order_snapshot(self, client: BinanceDemoClient, symbol: str, order: dict) -> dict:
         order_id = str(order.get("orderId", "")).strip()
@@ -2285,6 +2350,102 @@ class App(tk.Tk):
         if bid <= ZERO or ask <= ZERO:
             raise BinanceDemoError("Binance returned an invalid bid/ask for autotrade.")
         return bid, ask, (bid + ask) / Decimal("2")
+
+    def _spread_pct(self, bid: Decimal, ask: Decimal, mid: Decimal) -> Decimal:
+        if mid <= ZERO:
+            return ZERO
+        return (ask - bid) / mid * Decimal("100")
+
+    def _auto_trade_required_profit_pct(self, config: dict, spread_pct: Decimal) -> Decimal:
+        fee_and_buffer = config["round_trip_fee_pct"] + spread_pct + config["min_net_profit_pct"]
+        return max(config["take_profit_pct"], fee_and_buffer)
+
+    def _auto_trade_estimated_net_pnl(
+        self,
+        entry_price: Decimal,
+        exit_price: Decimal,
+        quantity: Decimal,
+        config: dict,
+    ) -> tuple[Decimal, Decimal, Decimal]:
+        gross = (exit_price - entry_price) * quantity
+        entry_fee = entry_price * quantity * config["fee_pct"] / Decimal("100")
+        exit_fee = exit_price * quantity * config["fee_pct"] / Decimal("100")
+        return gross - entry_fee - exit_fee, entry_fee, exit_fee
+
+    def _auto_trade_history_for(self, symbol: str) -> list[Decimal]:
+        symbol = symbol.upper()
+        history = self.auto_trade_price_histories.setdefault(symbol, [])
+        if symbol == self.symbol_var.get().strip().upper():
+            self.auto_trade_price_history = history
+        return history
+
+    def _append_auto_trade_price(self, symbol: str, mid: Decimal, window: int) -> tuple[list[Decimal], Decimal, Decimal]:
+        history = self._auto_trade_history_for(symbol)
+        history.append(mid)
+        if len(history) > window:
+            del history[:-window]
+        average_mid = sum(history, ZERO) / Decimal(len(history))
+        dip_pct = ((average_mid - mid) / average_mid * Decimal("100")) if average_mid > ZERO else ZERO
+        return history, average_mid, dip_pct
+
+    def _select_auto_trade_candidate(self, client: BinanceDemoClient, config: dict) -> dict:
+        symbols = config["scan_symbols"] if config["auto_select"] else [self.symbol_var.get().strip().upper()]
+        if not symbols or not symbols[0]:
+            raise BinanceDemoError("Set a symbol before enabling autotrade.")
+
+        books_by_symbol: dict[str, dict] = {}
+        try:
+            all_books = client.get_all_book_tickers()
+            if isinstance(all_books, list):
+                for item in all_books:
+                    if not isinstance(item, dict):
+                        continue
+                    item_symbol = str(item.get("symbol", "")).upper()
+                    if item_symbol in symbols:
+                        books_by_symbol[item_symbol] = item
+        except Exception:
+            books_by_symbol = {}
+
+        candidates: list[dict] = []
+        for symbol in symbols:
+            book = books_by_symbol.get(symbol) or client.get_book_ticker(symbol)
+            bid, ask, mid = self._market_prices(book)
+            spread_pct = self._spread_pct(bid, ask, mid)
+            history, average_mid, dip_pct = self._append_auto_trade_price(symbol, mid, config["window"])
+            ready = len(history) >= config["window"]
+            blocked_reason = ""
+            if spread_pct > config["max_spread_pct"]:
+                blocked_reason = f"spread {format_decimal(spread_pct, 3)}% > max {format_decimal(config['max_spread_pct'], 3)}%"
+            score = dip_pct - spread_pct - config["round_trip_fee_pct"]
+            candidates.append(
+                {
+                    "symbol": symbol,
+                    "bid": bid,
+                    "ask": ask,
+                    "mid": mid,
+                    "spread_pct": spread_pct,
+                    "history_size": len(history),
+                    "average_mid": average_mid,
+                    "dip_pct": dip_pct,
+                    "ready": ready,
+                    "blocked_reason": blocked_reason,
+                    "score": score,
+                }
+            )
+
+        candidates.sort(key=lambda item: item["score"], reverse=True)
+        top = candidates[:3]
+        top_text = "; ".join(
+            f"{item['symbol']} dip={format_decimal(item['dip_pct'], 2)}% spread={format_decimal(item['spread_pct'], 3)}% score={format_decimal(item['score'], 2)}"
+            for item in top
+        )
+        if top_text:
+            self.after(0, lambda text=top_text: self.log_info(f"[AUTO-TRADE] scan top: {text}"))
+
+        for candidate in candidates:
+            if candidate["ready"] and not candidate["blocked_reason"]:
+                return candidate
+        return candidates[0]
 
     def _evaluate_price_trigger(self, bid: Decimal, ask: Decimal, trigger_config: dict) -> tuple[bool, Decimal, str]:
         market_field = trigger_config["market_field"]
@@ -2353,6 +2514,7 @@ class App(tk.Tk):
         order: dict,
         fallback_price: Decimal,
         requested_qty: str,
+        fee_config: dict | None = None,
     ) -> tuple[Decimal, Decimal, Decimal, str]:
         sell_order_id = str(order.get("orderId", ""))
         executed_qty = decimal_or_zero(order.get("executedQty"))
@@ -2365,6 +2527,13 @@ class App(tk.Tk):
         realized_pnl = ZERO
         if self.auto_trade_entry_price and self.auto_trade_entry_price > ZERO and matched_qty > ZERO:
             realized_pnl = (exit_price * matched_qty) - (self.auto_trade_entry_price * matched_qty)
+            if fee_config is not None:
+                realized_pnl, _entry_fee_estimate, _exit_fee_estimate = self._auto_trade_estimated_net_pnl(
+                    self.auto_trade_entry_price,
+                    exit_price,
+                    matched_qty,
+                    fee_config,
+                )
 
         commission_amount, commission_asset = self._extract_commission_details(order)
         self._journal_order_event("order_update", symbol, reason, order, {"side": "SELL"})
@@ -2376,6 +2545,7 @@ class App(tk.Tk):
         self.position_entry_reason = ""
         self.position_entry_order_id = ""
         self.position_entry_commission = ZERO
+        self.auto_trade_entry_fee_estimate_quote = ZERO
 
         self.after(0, lambda oid=sell_order_id: self._set_last_order_id(oid))
         self.after(0, lambda qty=format_decimal(executed_qty): self.quantity_var.set(qty))
@@ -2973,7 +3143,12 @@ class App(tk.Tk):
                         f"Autotrade armed for price trigger: {trigger['condition']} {format_decimal(trigger['target'], 2)}."
                     )
                 else:
-                    self.log_warn("Autotrade mean reversion uses MARKET BUY / MARKET SELL on the Binance demo API. Demo only.")
+                    mode_text = "auto-select" if config["auto_select"] else "single-symbol"
+                    self.log_warn(
+                        f"Autotrade mean reversion uses MARKET BUY / MARKET SELL on the Binance demo API. "
+                        f"Mode={mode_text} | fee={format_decimal(config['fee_pct'], 3)}%/side | "
+                        f"min net={format_decimal(config['min_net_profit_pct'], 2)}% | max spread={format_decimal(config['max_spread_pct'], 3)}%. Demo only."
+                    )
                 self._set_auto_trade_last_check("Last check: waiting for first cycle", PNL_COLOR_NEUTRAL)
                 self._schedule_next_auto_trade(initial=True)
                 self._sync_auto_trade_buttons()
@@ -3055,14 +3230,36 @@ class App(tk.Tk):
             raise BinanceDemoError("Set a symbol before enabling autotrade.")
 
         self.after(0, lambda: self._set_health_api("connected"))
-        bid, ask, mid = self._current_market_prices(client, symbol)
-        self.auto_trade_price_history.append(mid)
-        if len(self.auto_trade_price_history) > config["window"]:
-            self.auto_trade_price_history = self.auto_trade_price_history[-config["window"] :]
+        has_position_basis = self.auto_trade_entry_price is not None and self.auto_trade_entry_price > ZERO
+        if config["auto_select"] and config["strategy_mode"] == "Mean reversion" and not has_position_basis:
+            candidate = self._select_auto_trade_candidate(client, config)
+            symbol = candidate["symbol"]
+            if symbol != self.symbol_var.get().strip().upper():
+                self.after(0, lambda s=symbol: self.symbol_var.set(s))
+            bid = candidate["bid"]
+            ask = candidate["ask"]
+            mid = candidate["mid"]
+            history_size = candidate["history_size"]
+            average_mid = candidate["average_mid"]
+            dip_pct = candidate["dip_pct"]
+            spread_pct = candidate["spread_pct"]
+            if candidate["blocked_reason"]:
+                self._publish_auto_trade_heartbeat("blocked-spread", symbol, mid, average_mid, dip_pct, PNL_COLOR_WARNING)
+                self.after(
+                    0,
+                    lambda s=symbol, reason=candidate["blocked_reason"]: self._set_auto_trade_status(
+                        f"Autotrade scan blocked {s}: {reason}",
+                        PNL_COLOR_WARNING,
+                    ),
+                )
+                return
+        else:
+            bid, ask, mid = self._current_market_prices(client, symbol)
+            history, average_mid, dip_pct = self._append_auto_trade_price(symbol, mid, config["window"])
+            history_size = len(history)
+            spread_pct = self._spread_pct(bid, ask, mid)
 
-        history_size = len(self.auto_trade_price_history)
-        average_mid = sum(self.auto_trade_price_history, ZERO) / Decimal(history_size)
-        dip_pct = ((average_mid - mid) / average_mid * Decimal("100")) if average_mid > ZERO else ZERO
+        required_profit_pct = self._auto_trade_required_profit_pct(config, spread_pct)
         now_ts = time.time()
         strategy_mode = config["strategy_mode"]
         execution_mode = config["execution_mode"]
@@ -3110,24 +3307,37 @@ class App(tk.Tk):
 
             entry_price = self.auto_trade_entry_price or mid
             pnl_pct = ((bid - entry_price) / entry_price * Decimal("100")) if entry_price > ZERO else ZERO
+            estimated_net_pnl, entry_fee_estimate, exit_fee_estimate = self._auto_trade_estimated_net_pnl(
+                entry_price,
+                bid,
+                free_qty,
+                config,
+            )
             status_color = PNL_COLOR_NEUTRAL
-            if pnl_pct > ZERO:
+            if estimated_net_pnl > ZERO:
                 status_color = PNL_COLOR_PROFIT
-            elif pnl_pct < ZERO:
+            elif estimated_net_pnl < ZERO:
                 status_color = PNL_COLOR_LOSS
 
             self._publish_auto_trade_heartbeat("hold", symbol, mid, average_mid, dip_pct, status_color)
             self.after(
                 0,
-                lambda s=symbol, qty=free_qty, entry=entry_price, b=bid, pct=pnl_pct: self._set_auto_trade_status(
-                    f"Autotrade HOLD {s} | qty={format_decimal(qty)} | entry={format_decimal(entry, 2)} | bid={format_decimal(b, 2)} | P/L={format_decimal(pct, 2)}%",
+                lambda s=symbol, qty=free_qty, entry=entry_price, b=bid, pct=pnl_pct, net=estimated_net_pnl, need=required_profit_pct: self._set_auto_trade_status(
+                    f"Autotrade HOLD {s} | qty={format_decimal(qty)} | entry={format_decimal(entry, 2)} | bid={format_decimal(b, 2)} | gross={format_decimal(pct, 2)}% | net≈{format_decimal(net, 2)} | target={format_decimal(need, 2)}%",
                     status_color,
+                ),
+            )
+            self.after(
+                0,
+                lambda s=symbol, net=estimated_net_pnl, ef=entry_fee_estimate, xf=exit_fee_estimate, sp=spread_pct: self.log_pnl(
+                    f"[AUTO-TRADE] progress {s}: net≈{format_decimal(net, 2)} after fees≈{format_decimal(ef + xf, 2)} | spread={format_decimal(sp, 3)}%",
+                    net,
                 ),
             )
 
             exit_reason = ""
-            if pnl_pct >= config["take_profit_pct"]:
-                exit_reason = "take-profit"
+            if pnl_pct >= required_profit_pct and estimated_net_pnl > ZERO:
+                exit_reason = "fee-aware take-profit"
             elif pnl_pct <= -config["stop_loss_pct"]:
                 exit_reason = "stop-loss"
 
@@ -3166,6 +3376,7 @@ class App(tk.Tk):
                 result,
                 bid,
                 sell_qty,
+                fee_config=config,
             )
             self.auto_trade_cooldown_until = now_ts + config["cooldown_seconds"]
 
@@ -3205,6 +3416,7 @@ class App(tk.Tk):
         self.position_entry_reason = ""
         self.position_entry_order_id = ""
         self.position_entry_commission = ZERO
+        self.auto_trade_entry_fee_estimate_quote = ZERO
         self.after(0, lambda: self._update_health_position(label="flat"))
 
         if now_ts < self.auto_trade_cooldown_until:
@@ -3245,14 +3457,17 @@ class App(tk.Tk):
             self._publish_auto_trade_heartbeat("ready", symbol, mid, average_mid, dip_pct, PNL_COLOR_NEUTRAL)
             self.after(
                 0,
-                lambda s=symbol, dip=dip_pct, avg=average_mid, m=mid, need=config["buy_threshold_pct"]: self._set_auto_trade_status(
-                    f"Autotrade READY {s} | mid={format_decimal(m, 2)} | SMA={format_decimal(avg, 2)} | dip={format_decimal(dip, 2)}%/{format_decimal(need, 2)}%",
+                lambda s=symbol, dip=dip_pct, avg=average_mid, m=mid, need=config["buy_threshold_pct"], sp=spread_pct, target=required_profit_pct: self._set_auto_trade_status(
+                    f"Autotrade READY {s} | mid={format_decimal(m, 2)} | SMA={format_decimal(avg, 2)} | dip={format_decimal(dip, 2)}%/{format_decimal(need, 2)}% | spread={format_decimal(sp, 3)}% | net target={format_decimal(target, 2)}%",
                     PNL_COLOR_NEUTRAL,
                 ),
             )
             if dip_pct < config["buy_threshold_pct"]:
                 return
-            signal_reason = f"Mean reversion buy: dip {format_decimal(dip_pct, 2)}% below SMA"
+            signal_reason = (
+                f"Mean reversion buy: dip {format_decimal(dip_pct, 2)}% below SMA | "
+                f"spread {format_decimal(spread_pct, 3)}% | target net-aware {format_decimal(required_profit_pct, 2)}%"
+            )
 
         self._publish_auto_trade_heartbeat("entry-signal", symbol, mid, average_mid, dip_pct, PNL_COLOR_PROFIT)
         self._enforce_risk_limits(client, symbol)
@@ -3283,10 +3498,11 @@ class App(tk.Tk):
         result = self._refresh_order_snapshot(client, symbol, result)
         self._journal_order_event("order_submit", symbol, signal_reason, result)
         entry_price, entry_qty, buy_order_id = self._record_entry_fill(symbol, signal_reason, result, ask, quantity)
+        self.auto_trade_entry_fee_estimate_quote = entry_price * entry_qty * config["fee_pct"] / Decimal("100")
         self.after(
             0,
-            lambda s=symbol, q=entry_qty, px=entry_price, reason=signal_reason: self.log_ok(
-                f"[AUTO-TRADE] BUY executed: {s} | {reason} | qty={format_decimal(q)} | avg={format_decimal(px, 2)}"
+            lambda s=symbol, q=entry_qty, px=entry_price, reason=signal_reason, fee=self.auto_trade_entry_fee_estimate_quote, target=required_profit_pct: self.log_ok(
+                f"[AUTO-TRADE] BUY executed: {s} | {reason} | qty={format_decimal(q)} | avg={format_decimal(px, 2)} | entry fee≈{format_decimal(fee, 2)} | exit target={format_decimal(target, 2)}%"
             ),
         )
         self.after(0, lambda payload=result: self.log_block("[AUTO-TRADE] Binance AUTO BUY response", payload))
