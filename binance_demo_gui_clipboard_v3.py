@@ -479,7 +479,7 @@ class App(tk.Tk):
         self.auto_trade_cooldown_var = tk.StringVar(value="30")
         self.auto_trade_status_var = tk.StringVar(value="Autotrade: OFF")
         self.auto_trade_last_check_var = tk.StringVar(value="Last check: never")
-        self.strategy_mode_var = tk.StringVar(value="Price trigger")
+        self.strategy_mode_var = tk.StringVar(value="Mean reversion")
         self.execution_mode_var = tk.StringVar(value="Test first")
         self.price_trigger_condition_var = tk.StringVar(value="ask <=")
         self.price_trigger_value_var = tk.StringVar(value="")
@@ -497,7 +497,7 @@ class App(tk.Tk):
         self.trade_history_interval_var = tk.StringVar(value="1h")
         self.trade_history_limit_var = tk.StringVar(value="50")
         self.health_api_var = tk.StringVar(value="API: unknown")
-        self.health_strategy_var = tk.StringVar(value="Strategy: Price trigger")
+        self.health_strategy_var = tk.StringVar(value="Strategy: Mean reversion")
         self.health_execution_var = tk.StringVar(value="Execution: Test first")
         self.health_market_ws_var = tk.StringVar(value="Market WS: off")
         self.health_user_ws_var = tk.StringVar(value="User WS: off")
@@ -1971,7 +1971,10 @@ class App(tk.Tk):
         condition = self.price_trigger_condition_var.get().strip()
         if condition not in ("ask <=", "bid <=", "ask >=", "bid >="):
             raise BinanceDemoError("Unsupported price trigger condition.")
-        target = self._validate_decimal_field(self.price_trigger_value_var.get(), "Price trigger value")
+        raw_target = self.price_trigger_value_var.get().strip()
+        if not raw_target:
+            raise BinanceDemoError("Set a price trigger value or switch Strategy to Mean reversion.")
+        target = self._validate_decimal_field(raw_target, "Price trigger value")
         market_field, operator = condition.split()
         return {
             "condition": condition,
