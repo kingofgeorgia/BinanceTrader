@@ -3,6 +3,7 @@ import csv
 import hashlib
 import hmac
 import json
+import socket
 import threading
 import time
 import tkinter as tk
@@ -24,6 +25,8 @@ BASE_URL = "https://demo-api.binance.com/api"
 DEMO_STREAM_BASE_URL = "wss://demo-stream.binance.com/ws"
 DEMO_WS_API_BASE_URL = "wss://demo-ws-api.binance.com/ws-api/v3"
 TIMEOUT_SECONDS = 15
+OPEN_ORDERS_RETRY_COUNT = 2
+OPEN_ORDERS_RETRY_DELAY_SECONDS = 0.7
 WEBSOCKET_RECONNECT_DELAY_SECONDS = 5
 ZERO = Decimal("0")
 MIN_RESTORED_POSITION_NOTIONAL = Decimal("1")
@@ -99,7 +102,12 @@ class BinanceDemoClient:
         except HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")
             raise BinanceDemoError(f"HTTP {exc.code}: {body}") from exc
+        except (TimeoutError, socket.timeout) as exc:
+            raise BinanceDemoError(f"Network timeout after {TIMEOUT_SECONDS}s: {method.upper()} {path}") from exc
         except URLError as exc:
+            reason = getattr(exc, "reason", exc)
+            if isinstance(reason, (TimeoutError, socket.timeout)) or "timed out" in str(reason).lower():
+                raise BinanceDemoError(f"Network timeout after {TIMEOUT_SECONDS}s: {method.upper()} {path}") from exc
             raise BinanceDemoError(f"Ошибка сети: {exc}") from exc
 
     def get_server_time(self) -> dict:
@@ -117,6 +125,18 @@ class BinanceDemoClient:
     def get_open_orders(self, symbol: str | None = None) -> list:
         params = {"symbol": symbol.upper()} if symbol else {}
         return self._request("GET", "/v3/openOrders", params, signed=True)
+
+    def get_open_orders_retry(self, symbol: str | None = None) -> list:
+        last_error: Exception | None = None
+        for attempt in range(OPEN_ORDERS_RETRY_COUNT + 1):
+            try:
+                return self.get_open_orders(symbol=symbol)
+            except BinanceDemoError as exc:
+                last_error = exc
+                if "timeout" not in str(exc).lower() or attempt >= OPEN_ORDERS_RETRY_COUNT:
+                    break
+                time.sleep(OPEN_ORDERS_RETRY_DELAY_SECONDS * (attempt + 1))
+        raise last_error or BinanceDemoError("Open orders request failed.")
 
     def get_order(self, symbol: str, order_id: str) -> dict:
         return self._request("GET", "/v3/order", {"symbol": symbol.upper(), "orderId": order_id}, signed=True)
@@ -1363,11 +1383,29 @@ class App(tk.Tk):
             self.quantity_var.set(qty_text)
 
     def _all_open_orders(self, client: BinanceDemoClient) -> list:
-        try:
-            return client.get_open_orders()
-        except TypeError:
-            symbol = self.symbol_var.get().strip().upper()
-            return client.get_open_orders(symbol=symbol)
+        symbols = {self.symbol_var.get().strip().upper()}
+        symbols.update(self.auto_trade_positions.keys())
+        raw_symbols = self.auto_trade_scan_symbols_var.get().replace("\n", ",")
+        for item in raw_symbols.split(","):
+            symbol = item.strip().upper()
+            if symbol:
+                symbols.add(symbol)
+
+        orders: list = []
+        errors: list[str] = []
+        for symbol in sorted(item for item in symbols if item):
+            try:
+                orders.extend(client.get_open_orders_retry(symbol=symbol))
+            except BinanceDemoError as exc:
+                errors.append(f"{symbol}: {exc}")
+        if errors:
+            self.after(
+                0,
+                lambda text="; ".join(errors[:3]): self.log_warn(
+                    f"Open-orders check skipped some symbols after retries: {text}"
+                ),
+            )
+        return orders
 
     def _enforce_risk_limits(self, client: BinanceDemoClient, symbol: str) -> dict:
         config = self._validate_risk_config()
@@ -3233,7 +3271,7 @@ class App(tk.Tk):
     def _check_open_orders_impl(self) -> None:
         client = self._client()
         symbol = self.symbol_var.get().strip().upper()
-        result = client.get_open_orders(symbol=symbol)
+        result = client.get_open_orders_retry(symbol=symbol)
         self.after(0, lambda: self._update_health_orders(len(result), symbol))
         self.after(0, lambda: self.log_ok(f"Открытых ордеров по {symbol}: {len(result)}"))
         if result:
@@ -3563,7 +3601,11 @@ class App(tk.Tk):
             if not exit_reason:
                 continue
 
-            open_orders = client.get_open_orders(symbol=symbol)
+            try:
+                open_orders = client.get_open_orders_retry(symbol=symbol)
+            except BinanceDemoError as exc:
+                self.after(0, lambda s=symbol, e=exc: self.log_warn(f"[AUTO-TRADE] {s} exit open-orders check timed out/skipped: {e}"))
+                continue
             self.after(0, lambda count=len(open_orders), s=symbol: self._update_health_orders(count, s))
             if open_orders:
                 self.after(0, lambda s=symbol, count=len(open_orders): self.log_warn(f"[AUTO-TRADE] {s} exit paused: {count} open order(s)."))
@@ -3629,7 +3671,11 @@ class App(tk.Tk):
                 continue
             if candidate["blocked_reason"] or not candidate["ready"]:
                 continue
-            open_orders = client.get_open_orders(symbol=symbol)
+            try:
+                open_orders = client.get_open_orders_retry(symbol=symbol)
+            except BinanceDemoError as exc:
+                self.after(0, lambda s=symbol, e=exc: self.log_warn(f"[AUTO-TRADE] {s} entry skipped: open-orders check failed after retries: {e}"))
+                continue
             if open_orders:
                 self.after(0, lambda s=symbol, count=len(open_orders): self.log_warn(f"[AUTO-TRADE] {s} entry skipped: {count} open order(s)."))
                 continue
@@ -3744,7 +3790,7 @@ class App(tk.Tk):
 
         position = self._position_balance_for_symbol(client, symbol)
         free_qty = position["free_qty"]
-        open_orders = client.get_open_orders(symbol=symbol)
+        open_orders = client.get_open_orders_retry(symbol=symbol)
         self.after(0, lambda count=len(open_orders), s=symbol: self._update_health_orders(count, s))
         if open_orders:
             self._publish_auto_trade_heartbeat("paused-open-orders", symbol, mid, average_mid, dip_pct, PNL_COLOR_WARNING)
