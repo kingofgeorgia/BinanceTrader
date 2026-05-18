@@ -491,8 +491,8 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Binance Spot Demo GUI")
-        self.geometry("1280x960")
-        self.minsize(1180, 860)
+        self.geometry("1540x960")
+        self.minsize(1320, 860)
 
         self.last_order_id_var = tk.StringVar(value="")
         self.auto_refresh_enabled = tk.BooleanVar(value=False)
@@ -540,6 +540,11 @@ class App(tk.Tk):
         self.health_last_fill_var = tk.StringVar(value="Last fill: —")
         self.health_today_var = tk.StringVar(value="Today: 0 fills | P/L 0")
         self.health_risk_var = tk.StringVar(value="Risk: filters enabled")
+        self.orders_summary_open_var = tk.StringVar(value="Открытые ордера: ?")
+        self.orders_summary_filled_var = tk.StringVar(value="Выполнено ордеров: 0")
+        self.orders_summary_profit_var = tk.StringVar(value="Заработок: 0 USDT")
+        self.current_open_orders_count = 0
+        self.open_orders_by_symbol: dict[str, int] = {}
         self.show_secret_var = tk.BooleanVar(value=False)
         self.pnl_var = tk.StringVar(value="P/L: —")
         self.position_var = tk.StringVar(value="Позиция: —")
@@ -608,7 +613,15 @@ class App(tk.Tk):
         outer = ttk.Frame(self, padding=12)
         outer.pack(fill="both", expand=True)
 
-        creds = ttk.LabelFrame(outer, text="Подключение и параметры", padding=12)
+        main = ttk.PanedWindow(outer, orient="horizontal")
+        main.pack(fill="both", expand=True)
+
+        left = ttk.Frame(main)
+        right = ttk.Frame(main)
+        main.add(left, weight=3)
+        main.add(right, weight=2)
+
+        creds = ttk.LabelFrame(left, text="Подключение и параметры", padding=12)
         creds.pack(fill="x")
         creds.columnconfigure(1, weight=1)
         creds.columnconfigure(2, weight=1)
@@ -666,7 +679,7 @@ class App(tk.Tk):
             text="Если Price пустой, программа возьмёт лучший ask и поставит BUY-лимит на 0.1% ниже.",
         ).grid(row=5, column=1, columnspan=3, sticky="w", pady=(2, 0))
 
-        actions = ttk.LabelFrame(outer, text="Действия", padding=12)
+        actions = ttk.LabelFrame(left, text="Действия", padding=12)
         actions.pack(fill="x", pady=(12, 0))
 
         self.check_button = ttk.Button(actions, text="Проверить API", command=self.check_api)
@@ -688,7 +701,7 @@ class App(tk.Tk):
         self.clear_button = ttk.Button(actions, text="Очистить лог", command=self.clear_log)
         self.clear_button.pack(side="left", padx=6)
 
-        auto = ttk.LabelFrame(outer, text="Автообновление статуса", padding=12)
+        auto = ttk.LabelFrame(left, text="Автообновление статуса", padding=12)
         auto.pack(fill="x", pady=(12, 0))
 
         ttk.Label(auto, text="Интервал").pack(side="left")
@@ -713,10 +726,35 @@ class App(tk.Tk):
         self.last_order_label = ttk.Label(auto, text="Последний ордер: —")
         self.last_order_label.pack(side="right")
 
-        summary = ttk.LabelFrame(outer, text="Мониторинг сделки", padding=12)
+        summary = ttk.LabelFrame(left, text="Мониторинг сделки", padding=12)
         summary.pack(fill="x", pady=(12, 0))
 
-        autotrade = ttk.LabelFrame(outer, text="Autotrade (DEMO)", padding=12)
+        orders_summary = ttk.LabelFrame(left, text="Сводка ордеров", padding=12)
+        orders_summary.pack(fill="x", pady=(12, 0))
+        orders_summary.columnconfigure(0, weight=1)
+        orders_summary.columnconfigure(1, weight=1)
+        orders_summary.columnconfigure(2, weight=1)
+
+        ttk.Label(
+            orders_summary,
+            textvariable=self.orders_summary_open_var,
+            font=("Segoe UI", 10, "bold"),
+        ).grid(row=0, column=0, sticky="w", padx=(0, 20), pady=2)
+        ttk.Label(
+            orders_summary,
+            textvariable=self.orders_summary_filled_var,
+            font=("Segoe UI", 10, "bold"),
+        ).grid(row=0, column=1, sticky="w", padx=(0, 20), pady=2)
+        self.orders_summary_profit_label = tk.Label(
+            orders_summary,
+            textvariable=self.orders_summary_profit_var,
+            font=("Segoe UI", 10, "bold"),
+            fg=PNL_COLOR_NEUTRAL,
+            anchor="w",
+        )
+        self.orders_summary_profit_label.grid(row=0, column=2, sticky="w", pady=2)
+
+        autotrade = ttk.LabelFrame(left, text="Autotrade (DEMO)", padding=12)
         autotrade.pack(fill="x", pady=(12, 0))
         autotrade.columnconfigure(1, weight=1)
         autotrade.columnconfigure(3, weight=1)
@@ -833,7 +871,7 @@ class App(tk.Tk):
         self.auto_trade_last_check_label.grid(row=5, column=0, columnspan=8, sticky="ew", pady=(8, 0))
         self._sync_auto_trade_buttons()
 
-        strategy = ttk.LabelFrame(outer, text="Strategy & Execution", padding=12)
+        strategy = ttk.LabelFrame(left, text="Strategy & Execution", padding=12)
         strategy.pack(fill="x", pady=(12, 0))
         strategy.columnconfigure(1, weight=1)
         strategy.columnconfigure(3, weight=1)
@@ -876,7 +914,7 @@ class App(tk.Tk):
             text="Price trigger buys on the selected market condition. Mean reversion uses the SMA/dip fields above. Manual = signal only.",
         ).grid(row=1, column=0, columnspan=6, sticky="w", pady=(4, 0))
 
-        risk = ttk.LabelFrame(outer, text="Risk Manager", padding=12)
+        risk = ttk.LabelFrame(left, text="Risk Manager", padding=12)
         risk.pack(fill="x", pady=(12, 0))
         risk.columnconfigure(1, weight=1)
         risk.columnconfigure(3, weight=1)
@@ -936,7 +974,7 @@ class App(tk.Tk):
         ttk.Label(risk, textvariable=self.risk_allowed_loss_var).grid(row=2, column=2, columnspan=2, sticky="w", pady=(8, 0))
         ttk.Label(risk, textvariable=self.risk_preview_var).grid(row=2, column=4, columnspan=3, sticky="w", pady=(8, 0))
 
-        trade_history = ttk.LabelFrame(outer, text="Trade History", padding=12)
+        trade_history = ttk.LabelFrame(left, text="Trade History", padding=12)
         trade_history.pack(fill="x", pady=(12, 0))
 
         ttk.Label(trade_history, text="Interval").pack(side="left")
@@ -969,7 +1007,7 @@ class App(tk.Tk):
             text="Loads account trades for the current symbol from Binance myTrades.",
         ).pack(side="left", padx=(12, 0))
 
-        health = ttk.LabelFrame(outer, text="Strategy Health", padding=12)
+        health = ttk.LabelFrame(left, text="Strategy Health", padding=12)
         health.pack(fill="x", pady=(12, 0))
         health.columnconfigure(1, weight=1)
         health.columnconfigure(3, weight=1)
@@ -1003,8 +1041,8 @@ class App(tk.Tk):
         )
         self.pnl_label.pack(side="left", padx=(24, 0))
 
-        log_box = ttk.LabelFrame(outer, text="Лог", padding=12)
-        log_box.pack(fill="both", expand=True, pady=(12, 0))
+        log_box = ttk.LabelFrame(right, text="Лог", padding=12)
+        log_box.pack(fill="both", expand=True, padx=(12, 0))
 
         self.log = tk.Text(
             log_box,
@@ -1167,8 +1205,27 @@ class App(tk.Tk):
         self.health_api_var.set(f"API: {message}")
 
     def _update_health_orders(self, count: int, symbol: str = "") -> None:
+        if symbol:
+            self.open_orders_by_symbol[symbol] = count
+            self.current_open_orders_count = sum(self.open_orders_by_symbol.values())
+        else:
+            self.current_open_orders_count = count
         suffix = f" on {symbol}" if symbol else ""
         self.health_orders_var.set(f"Open orders: {count}{suffix}")
+        self._refresh_order_summary()
+
+    def _refresh_order_summary(self) -> None:
+        self.orders_summary_open_var.set(f"Открытые ордера: {self.current_open_orders_count}")
+        self.orders_summary_filled_var.set(f"Выполнено ордеров: {self.today_fill_count}")
+        sign = "+" if self.today_realized_pnl > ZERO else ""
+        self.orders_summary_profit_var.set(f"Заработок: {sign}{format_decimal(self.today_realized_pnl, 2)} USDT")
+        if hasattr(self, "orders_summary_profit_label"):
+            color = PNL_COLOR_NEUTRAL
+            if self.today_realized_pnl > ZERO:
+                color = PNL_COLOR_PROFIT
+            elif self.today_realized_pnl < ZERO:
+                color = PNL_COLOR_LOSS
+            self.orders_summary_profit_label.configure(fg=color)
 
     def _update_health_position(
         self,
@@ -1212,6 +1269,7 @@ class App(tk.Tk):
         self.health_today_var.set(
             f"Today: {self.today_fill_count} fills | P/L {sign}{format_decimal(self.today_realized_pnl, 2)} | loss streak {self.consecutive_loss_count}"
         )
+        self._refresh_order_summary()
 
     def _register_fill(self, pnl_quote: Decimal | None = None) -> None:
         self._roll_today_metrics_if_needed()
@@ -1943,8 +2001,8 @@ class App(tk.Tk):
         elif order_id:
             self.user_stream_open_orders.setdefault(symbol, set()).discard(order_id)
 
+        self._update_health_orders(len(self.user_stream_open_orders.get(symbol, set())), symbol)
         if symbol == self.symbol_var.get().strip().upper():
-            self._update_health_orders(self._current_symbol_open_order_count(), symbol)
             self._set_last_order_id(order_id)
 
         average_price = ZERO
