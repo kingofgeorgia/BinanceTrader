@@ -7,8 +7,10 @@ A desktop GUI for Binance Demo trading. The app lets you connect with Binance De
 - Tkinter desktop interface
 - Binance Demo REST API integration
 - Binance Demo WebSocket support
-- Market, limit, stop-loss, and take-profit order workflows
+- Market, limit, stop-loss, take-profit, break-even, and trailing-stop order workflows
 - Fee-aware multi-position autotrade scanner for selected USDT pairs
+- Kline-based EMA/ATR/RSI, volume, volatility, and trend filters
+- Kline backtest that reuses the live autotrade signal and exit logic
 - Local order and position persistence
 - CSV trade journal export
 
@@ -56,6 +58,14 @@ Key controls:
 - `Fee %`: estimated fee per side.
 - `Min net %`: extra target profit after estimated fees and spread.
 - `Max spread %`: skips pairs with a wider spread.
+- `Klines` / `Bars`: candle interval and sample size for EMA/ATR/RSI calculations.
+- `Min vol USDT`: minimum quote volume over the recent candle window.
+- `Trend EMA`: requires EMA20/EMA50 bullish trend before a mean-reversion entry.
+- `ATR % min/max`: skips pairs that are too flat or too volatile.
+- `Trail %`: trailing stop distance from the best price after entry.
+- `BE arm %`: profit threshold that arms a fee-aware break-even stop.
+
+Use `Run backtest` in the `Trade History` block to test the current symbol with the same mean-reversion signal filters and exit logic used by the live autotrade loop.
 
 The bot saves portfolio state in `positions.json` and restores it on startup. It still cannot guarantee profit; market moves, slippage, liquidity, and API behavior can produce losses.
 

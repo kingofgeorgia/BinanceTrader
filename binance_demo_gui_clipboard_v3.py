@@ -51,6 +51,12 @@ TRADE_HISTORY_INTERVAL_SECONDS = {
     "12h": 12 * 60 * 60,
     "24h": 24 * 60 * 60,
 }
+KLINE_INTERVALS = ("1m", "3m", "5m", "15m", "30m", "1h", "4h")
+EMA_FAST_PERIOD = 20
+EMA_SLOW_PERIOD = 50
+ATR_PERIOD = 14
+RSI_PERIOD = 14
+VOLUME_LOOKBACK = 20
 
 
 class BinanceDemoError(RuntimeError):
@@ -122,6 +128,13 @@ class BinanceDemoClient:
 
     def get_all_book_tickers(self) -> list:
         return self._request("GET", "/v3/ticker/bookTicker")
+
+    def get_klines(self, symbol: str, interval: str = "1m", limit: int = 120) -> list:
+        return self._request(
+            "GET",
+            "/v3/klines",
+            {"symbol": symbol.upper(), "interval": interval, "limit": limit},
+        )
 
     def get_open_orders(self, symbol: str | None = None) -> list:
         params = {"symbol": symbol.upper()} if symbol else {}
@@ -525,6 +538,14 @@ class App(tk.Tk):
         self.auto_trade_capital_per_position_var = tk.StringVar(value="100")
         self.auto_trade_parallel_var = tk.BooleanVar(value=True)
         self.auto_trade_workers_var = tk.StringVar(value="4")
+        self.auto_trade_kline_interval_var = tk.StringVar(value="1m")
+        self.auto_trade_kline_limit_var = tk.StringVar(value="120")
+        self.auto_trade_min_quote_volume_var = tk.StringVar(value="25000")
+        self.auto_trade_min_atr_pct_var = tk.StringVar(value="0.03")
+        self.auto_trade_max_atr_pct_var = tk.StringVar(value="2.50")
+        self.auto_trade_trend_filter_var = tk.BooleanVar(value=True)
+        self.auto_trade_trailing_stop_var = tk.StringVar(value="0.30")
+        self.auto_trade_break_even_profit_var = tk.StringVar(value="0.25")
         self.auto_trade_status_var = tk.StringVar(value="Autotrade: OFF")
         self.auto_trade_last_check_var = tk.StringVar(value="Last check: never")
         self.strategy_mode_var = tk.StringVar(value="Mean reversion")
@@ -861,8 +882,55 @@ class App(tk.Tk):
             row=4, column=2, sticky="w", pady=(10, 0)
         )
 
+        ttk.Label(autotrade, text="Klines").grid(row=5, column=0, sticky="w", padx=(0, 8), pady=4)
+        ttk.Combobox(
+            autotrade,
+            textvariable=self.auto_trade_kline_interval_var,
+            values=KLINE_INTERVALS,
+            width=8,
+            state="readonly",
+        ).grid(row=5, column=1, sticky="w", pady=4)
+
+        ttk.Label(autotrade, text="Bars").grid(row=5, column=2, sticky="e", padx=(16, 8), pady=4)
+        ttk.Combobox(
+            autotrade,
+            textvariable=self.auto_trade_kline_limit_var,
+            values=("60", "120", "200", "500", "1000"),
+            width=8,
+            state="readonly",
+        ).grid(row=5, column=3, sticky="w", pady=4)
+
+        ttk.Label(autotrade, text="Min vol USDT").grid(row=5, column=4, sticky="e", padx=(16, 8), pady=4)
+        tk.Entry(autotrade, textvariable=self.auto_trade_min_quote_volume_var, width=12, font=("Consolas", 10)).grid(
+            row=5, column=5, sticky="w", pady=4
+        )
+
+        ttk.Checkbutton(
+            autotrade,
+            text="Trend EMA",
+            variable=self.auto_trade_trend_filter_var,
+        ).grid(row=5, column=6, columnspan=2, sticky="w", padx=(16, 0), pady=4)
+
+        ttk.Label(autotrade, text="ATR % min/max").grid(row=6, column=0, sticky="w", padx=(0, 8), pady=4)
+        atr_controls = ttk.Frame(autotrade)
+        atr_controls.grid(row=6, column=1, columnspan=2, sticky="w", pady=4)
+        tk.Entry(atr_controls, textvariable=self.auto_trade_min_atr_pct_var, width=8, font=("Consolas", 10)).pack(side="left")
+        tk.Entry(atr_controls, textvariable=self.auto_trade_max_atr_pct_var, width=8, font=("Consolas", 10)).pack(
+            side="left", padx=(6, 0)
+        )
+
+        ttk.Label(autotrade, text="Trail %").grid(row=6, column=3, sticky="e", padx=(16, 8), pady=4)
+        tk.Entry(autotrade, textvariable=self.auto_trade_trailing_stop_var, width=10, font=("Consolas", 10)).grid(
+            row=6, column=4, sticky="w", pady=4
+        )
+
+        ttk.Label(autotrade, text="BE arm %").grid(row=6, column=5, sticky="e", padx=(16, 8), pady=4)
+        tk.Entry(autotrade, textvariable=self.auto_trade_break_even_profit_var, width=10, font=("Consolas", 10)).grid(
+            row=6, column=6, sticky="w", pady=4
+        )
+
         auto_trade_buttons = ttk.Frame(autotrade)
-        auto_trade_buttons.grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        auto_trade_buttons.grid(row=7, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         self.start_auto_trade_button = ttk.Button(
             auto_trade_buttons,
@@ -885,7 +953,7 @@ class App(tk.Tk):
             anchor="w",
             fg=PNL_COLOR_NEUTRAL,
         )
-        self.auto_trade_status_label.grid(row=5, column=2, columnspan=6, sticky="ew", padx=(16, 0), pady=(10, 0))
+        self.auto_trade_status_label.grid(row=7, column=2, columnspan=6, sticky="ew", padx=(16, 0), pady=(10, 0))
         self.auto_trade_last_check_label = tk.Label(
             autotrade,
             textvariable=self.auto_trade_last_check_var,
@@ -893,7 +961,7 @@ class App(tk.Tk):
             anchor="w",
             fg=PNL_COLOR_NEUTRAL,
         )
-        self.auto_trade_last_check_label.grid(row=6, column=0, columnspan=8, sticky="ew", pady=(8, 0))
+        self.auto_trade_last_check_label.grid(row=8, column=0, columnspan=8, sticky="ew", pady=(8, 0))
         self._sync_auto_trade_buttons()
 
         strategy = ttk.LabelFrame(left, text="Strategy & Execution", padding=12)
@@ -1026,10 +1094,16 @@ class App(tk.Tk):
             command=self.load_trade_history,
         )
         self.trade_history_button.pack(side="left")
+        self.backtest_button = ttk.Button(
+            trade_history,
+            text="Run backtest",
+            command=self.run_backtest,
+        )
+        self.backtest_button.pack(side="left", padx=(8, 0))
 
         ttk.Label(
             trade_history,
-            text="Loads account trades for the current symbol from Binance myTrades.",
+            text="Loads account trades or backtests the current autotrade signal on klines.",
         ).pack(side="left", padx=(12, 0))
 
         health = ttk.LabelFrame(left, text="Strategy Health", padding=12)
@@ -1574,6 +1648,10 @@ class App(tk.Tk):
                     "entry_fee_estimate_quote": format_decimal(
                         decimal_or_zero(position.get("entry_fee_estimate_quote"))
                     ),
+                    "peak_price": format_decimal(decimal_or_zero(position.get("peak_price"))),
+                    "trailing_stop_price": format_decimal(decimal_or_zero(position.get("trailing_stop_price"))),
+                    "break_even_armed": bool(position.get("break_even_armed", False)),
+                    "break_even_price": format_decimal(decimal_or_zero(position.get("break_even_price"))),
                 }
                 for symbol, position in sorted(self.auto_trade_positions.items())
             },
@@ -1637,6 +1715,10 @@ class App(tk.Tk):
                     "entry_reason": str(position.get("entry_reason", "Restored from positions.json")),
                     "entry_order_id": str(position.get("entry_order_id", "")),
                     "entry_fee_estimate_quote": decimal_or_zero(position.get("entry_fee_estimate_quote")),
+                    "peak_price": max(decimal_or_zero(position.get("peak_price")), entry_price),
+                    "trailing_stop_price": decimal_or_zero(position.get("trailing_stop_price")),
+                    "break_even_armed": self._position_flag_enabled(position.get("break_even_armed")),
+                    "break_even_price": decimal_or_zero(position.get("break_even_price")),
                 }
 
         if self.auto_trade_positions:
@@ -2053,6 +2135,10 @@ class App(tk.Tk):
                     "entry_reason": self.position_entry_reason,
                     "entry_order_id": order_id,
                     "entry_fee_estimate_quote": ZERO,
+                    "peak_price": average_price,
+                    "trailing_stop_price": ZERO,
+                    "break_even_armed": False,
+                    "break_even_price": ZERO,
                 }
             if symbol == self.symbol_var.get().strip().upper():
                 self._update_health_position(symbol, cumulative_qty, self.auto_trade_entry_price)
@@ -2214,6 +2300,7 @@ class App(tk.Tk):
             self.close_sell_button,
             self.open_orders_button,
             self.trade_history_button,
+            self.backtest_button,
         ):
             button.configure(state=state)
 
@@ -2329,6 +2416,13 @@ class App(tk.Tk):
             self.auto_trade_min_net_profit_var.get(), "Min net %", allow_zero=True
         )
         max_spread_pct = self._validate_decimal_field(self.auto_trade_max_spread_var.get(), "Max spread %")
+        kline_interval = self.auto_trade_kline_interval_var.get().strip()
+        if kline_interval not in KLINE_INTERVALS:
+            raise BinanceDemoError("Unsupported kline interval.")
+        min_atr_pct = self._validate_decimal_field(self.auto_trade_min_atr_pct_var.get(), "ATR min %", allow_zero=True)
+        max_atr_pct = self._validate_decimal_field(self.auto_trade_max_atr_pct_var.get(), "ATR max %", allow_zero=True)
+        if max_atr_pct > ZERO and min_atr_pct > max_atr_pct:
+            raise BinanceDemoError("ATR min % cannot be greater than ATR max %.")
         config = {
             "interval_seconds": self._validate_int_field(self.auto_trade_interval_var.get(), "Auto interval", minimum=1),
             "window": self._validate_int_field(self.auto_trade_window_var.get(), "SMA window", minimum=3),
@@ -2350,6 +2444,23 @@ class App(tk.Tk):
             "parallel_workers": min(
                 self._validate_int_field(self.auto_trade_workers_var.get(), "Workers", minimum=1),
                 8,
+            ),
+            "kline_interval": kline_interval,
+            "kline_limit": min(
+                self._validate_int_field(self.auto_trade_kline_limit_var.get(), "Kline bars", minimum=EMA_SLOW_PERIOD + 10),
+                1000,
+            ),
+            "min_quote_volume": self._validate_decimal_field(
+                self.auto_trade_min_quote_volume_var.get(), "Min vol USDT", allow_zero=True
+            ),
+            "min_atr_pct": min_atr_pct,
+            "max_atr_pct": max_atr_pct,
+            "trend_filter_enabled": bool(self.auto_trade_trend_filter_var.get()),
+            "trailing_stop_pct": self._validate_decimal_field(
+                self.auto_trade_trailing_stop_var.get(), "Trail %", allow_zero=True
+            ),
+            "break_even_profit_pct": self._validate_decimal_field(
+                self.auto_trade_break_even_profit_var.get(), "BE arm %", allow_zero=True
             ),
             "strategy_mode": self._validate_strategy_mode(),
             "execution_mode": self._validate_execution_mode(),
@@ -2654,6 +2765,73 @@ class App(tk.Tk):
         exit_fee = exit_price * quantity * config["fee_pct"] / Decimal("100")
         return gross - entry_fee - exit_fee, entry_fee, exit_fee
 
+    def _position_flag_enabled(self, value) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _auto_trade_exit_snapshot(
+        self,
+        position_state: dict,
+        entry_price: Decimal,
+        bid: Decimal,
+        quantity: Decimal,
+        spread_pct: Decimal,
+        config: dict,
+    ) -> dict:
+        pnl_pct = ((bid - entry_price) / entry_price * Decimal("100")) if entry_price > ZERO else ZERO
+        estimated_net_pnl, entry_fee_estimate, exit_fee_estimate = self._auto_trade_estimated_net_pnl(
+            entry_price,
+            bid,
+            quantity,
+            config,
+        )
+        required_profit_pct = self._auto_trade_required_profit_pct(config, spread_pct)
+
+        peak_price = max(decimal_or_zero(position_state.get("peak_price")), entry_price, bid)
+        position_state["peak_price"] = peak_price
+
+        trailing_stop_price = ZERO
+        if config["trailing_stop_pct"] > ZERO and peak_price > entry_price:
+            trailing_stop_price = peak_price * (Decimal("1") - config["trailing_stop_pct"] / Decimal("100"))
+            position_state["trailing_stop_price"] = trailing_stop_price
+        else:
+            position_state["trailing_stop_price"] = ZERO
+
+        break_even_armed = self._position_flag_enabled(position_state.get("break_even_armed"))
+        break_even_price = ZERO
+        if config["break_even_profit_pct"] > ZERO:
+            break_even_price = entry_price * (
+                Decimal("1") + config["round_trip_fee_pct"] / Decimal("100")
+            )
+            if pnl_pct >= config["break_even_profit_pct"] and estimated_net_pnl >= ZERO:
+                break_even_armed = True
+            position_state["break_even_armed"] = break_even_armed
+            position_state["break_even_price"] = break_even_price
+
+        exit_reason = ""
+        if pnl_pct >= required_profit_pct and estimated_net_pnl > ZERO:
+            exit_reason = "fee-aware take-profit"
+        elif trailing_stop_price > ZERO and bid <= trailing_stop_price and estimated_net_pnl > ZERO:
+            exit_reason = "trailing-stop"
+        elif break_even_armed and bid <= break_even_price and estimated_net_pnl >= ZERO:
+            exit_reason = "break-even-stop"
+        elif pnl_pct <= -config["stop_loss_pct"]:
+            exit_reason = "stop-loss"
+
+        return {
+            "exit_reason": exit_reason,
+            "pnl_pct": pnl_pct,
+            "estimated_net_pnl": estimated_net_pnl,
+            "entry_fee_estimate": entry_fee_estimate,
+            "exit_fee_estimate": exit_fee_estimate,
+            "required_profit_pct": required_profit_pct,
+            "peak_price": peak_price,
+            "trailing_stop_price": trailing_stop_price,
+            "break_even_armed": break_even_armed,
+            "break_even_price": break_even_price,
+        }
+
     def _quantity_for_capital(
         self,
         client: BinanceDemoClient,
@@ -2687,6 +2865,238 @@ class App(tk.Tk):
         average_mid = sum(history, ZERO) / Decimal(len(history))
         dip_pct = ((average_mid - mid) / average_mid * Decimal("100")) if average_mid > ZERO else ZERO
         return history, average_mid, dip_pct
+
+    def _parse_klines(self, rows: list) -> list[dict]:
+        parsed: list[dict] = []
+        for row in rows:
+            if not isinstance(row, list) or len(row) < 8:
+                continue
+            open_price = decimal_or_zero(row[1])
+            high = decimal_or_zero(row[2])
+            low = decimal_or_zero(row[3])
+            close = decimal_or_zero(row[4])
+            volume = decimal_or_zero(row[5])
+            quote_volume = decimal_or_zero(row[7])
+            if open_price <= ZERO or high <= ZERO or low <= ZERO or close <= ZERO:
+                continue
+            parsed.append(
+                {
+                    "open_time": int(row[0]) if str(row[0]).isdigit() else 0,
+                    "open": open_price,
+                    "high": high,
+                    "low": low,
+                    "close": close,
+                    "volume": volume,
+                    "quote_volume": quote_volume,
+                }
+            )
+        return parsed
+
+    def _ema(self, values: list[Decimal], period: int) -> Decimal | None:
+        if len(values) < period:
+            return None
+        ema = sum(values[:period], ZERO) / Decimal(period)
+        multiplier = Decimal("2") / Decimal(period + 1)
+        for value in values[period:]:
+            ema = (value - ema) * multiplier + ema
+        return ema
+
+    def _atr(self, candles: list[dict], period: int = ATR_PERIOD) -> Decimal | None:
+        if len(candles) < period + 1:
+            return None
+        ranges: list[Decimal] = []
+        previous_close = candles[0]["close"]
+        for candle in candles[1:]:
+            high = candle["high"]
+            low = candle["low"]
+            true_range = max(high - low, abs(high - previous_close), abs(low - previous_close))
+            ranges.append(true_range)
+            previous_close = candle["close"]
+        if len(ranges) < period:
+            return None
+        return sum(ranges[-period:], ZERO) / Decimal(period)
+
+    def _rsi(self, values: list[Decimal], period: int = RSI_PERIOD) -> Decimal | None:
+        if len(values) <= period:
+            return None
+        gains = ZERO
+        losses = ZERO
+        window = values[-(period + 1):]
+        for previous, current in zip(window, window[1:]):
+            change = current - previous
+            if change > ZERO:
+                gains += change
+            else:
+                losses += abs(change)
+        average_gain = gains / Decimal(period)
+        average_loss = losses / Decimal(period)
+        if average_loss == ZERO:
+            return Decimal("100") if average_gain > ZERO else Decimal("50")
+        relative_strength = average_gain / average_loss
+        return Decimal("100") - (Decimal("100") / (Decimal("1") + relative_strength))
+
+    def _indicator_snapshot_from_candles(self, candles: list[dict]) -> dict:
+        if len(candles) < EMA_SLOW_PERIOD:
+            return {
+                "ok": False,
+                "error": f"not enough kline rows ({len(candles)}/{EMA_SLOW_PERIOD})",
+            }
+        closes = [item["close"] for item in candles]
+        last_close = closes[-1]
+        ema_fast = self._ema(closes, EMA_FAST_PERIOD)
+        ema_slow = self._ema(closes, EMA_SLOW_PERIOD)
+        atr = self._atr(candles)
+        atr_pct = (atr / last_close * Decimal("100")) if atr is not None and last_close > ZERO else None
+        rsi = self._rsi(closes)
+        volume_window = candles[-min(VOLUME_LOOKBACK, len(candles)):]
+        quote_volume = sum((item["quote_volume"] for item in volume_window), ZERO)
+        base_volume = sum((item["volume"] for item in volume_window), ZERO)
+        trend_ok = bool(
+            ema_fast is not None
+            and ema_slow is not None
+            and ema_fast >= ema_slow
+            and last_close >= ema_slow
+        )
+        return {
+            "ok": True,
+            "error": "",
+            "candles": candles,
+            "close": last_close,
+            "ema_fast": ema_fast,
+            "ema_slow": ema_slow,
+            "atr_pct": atr_pct,
+            "rsi": rsi,
+            "quote_volume": quote_volume,
+            "base_volume": base_volume,
+            "trend_ok": trend_ok,
+            "rows": len(candles),
+        }
+
+    def _indicator_snapshot_from_rows(self, rows: list) -> dict:
+        return self._indicator_snapshot_from_candles(self._parse_klines(rows))
+
+    def _indicator_snapshot_for_symbol(self, client: BinanceDemoClient, symbol: str, config: dict) -> dict:
+        try:
+            rows = client.get_klines(symbol, config["kline_interval"], config["kline_limit"])
+            snapshot = self._indicator_snapshot_from_rows(rows)
+            snapshot["symbol"] = symbol
+            return snapshot
+        except Exception as exc:
+            return {"symbol": symbol, "ok": False, "error": str(exc)}
+
+    def _attach_candidate_filters(self, candidate: dict, indicator: dict | None, config: dict) -> dict:
+        blocked_reasons = [candidate["blocked_reason"]] if candidate.get("blocked_reason") else []
+        if not indicator or not indicator.get("ok"):
+            blocked_reasons.append(f"klines unavailable: {(indicator or {}).get('error', 'missing')}")
+            candidate["blocked_reason"] = "; ".join(blocked_reasons)
+            candidate["score"] = candidate["score"] - Decimal("100")
+            return candidate
+
+        candidate.update(
+            {
+                "ema_fast": indicator.get("ema_fast"),
+                "ema_slow": indicator.get("ema_slow"),
+                "atr_pct": indicator.get("atr_pct"),
+                "rsi": indicator.get("rsi"),
+                "quote_volume": indicator.get("quote_volume", ZERO),
+                "base_volume": indicator.get("base_volume", ZERO),
+                "trend_ok": bool(indicator.get("trend_ok")),
+                "kline_rows": indicator.get("rows", 0),
+            }
+        )
+
+        quote_volume = decimal_or_zero(candidate.get("quote_volume"))
+        atr_pct = candidate.get("atr_pct")
+        if config["min_quote_volume"] > ZERO and quote_volume < config["min_quote_volume"]:
+            blocked_reasons.append(
+                f"volume {format_decimal(quote_volume, 2)} < min {format_decimal(config['min_quote_volume'], 2)}"
+            )
+        if atr_pct is None:
+            blocked_reasons.append("ATR unavailable")
+        else:
+            if config["min_atr_pct"] > ZERO and atr_pct < config["min_atr_pct"]:
+                blocked_reasons.append(
+                    f"ATR {format_decimal(atr_pct, 3)}% < min {format_decimal(config['min_atr_pct'], 3)}%"
+                )
+            if config["max_atr_pct"] > ZERO and atr_pct > config["max_atr_pct"]:
+                blocked_reasons.append(
+                    f"ATR {format_decimal(atr_pct, 3)}% > max {format_decimal(config['max_atr_pct'], 3)}%"
+                )
+        if config["trend_filter_enabled"] and not candidate["trend_ok"]:
+            ema_fast = candidate.get("ema_fast")
+            ema_slow = candidate.get("ema_slow")
+            fast_text = format_decimal(ema_fast, 2) if isinstance(ema_fast, Decimal) else "n/a"
+            slow_text = format_decimal(ema_slow, 2) if isinstance(ema_slow, Decimal) else "n/a"
+            blocked_reasons.append(f"trend filter failed EMA{EMA_FAST_PERIOD}={fast_text} EMA{EMA_SLOW_PERIOD}={slow_text}")
+
+        score = candidate["score"]
+        if candidate["trend_ok"]:
+            score += Decimal("0.25")
+        if isinstance(atr_pct, Decimal):
+            score += min(atr_pct, Decimal("1.0")) / Decimal("4")
+        rsi = candidate.get("rsi")
+        if isinstance(rsi, Decimal) and Decimal("25") <= rsi <= Decimal("55"):
+            score += (Decimal("55") - rsi) / Decimal("20")
+        candidate["score"] = score
+        candidate["blocked_reason"] = "; ".join(blocked_reasons)
+        return candidate
+
+    def _mean_reversion_signal(self, candidate: dict, config: dict) -> tuple[bool, str]:
+        if not candidate.get("ready"):
+            return False, f"warmup {candidate.get('history_size', 0)}/{config['window']}"
+        if candidate.get("blocked_reason"):
+            return False, candidate["blocked_reason"]
+        dip_pct = candidate["dip_pct"]
+        if dip_pct < config["buy_threshold_pct"]:
+            return False, f"dip {format_decimal(dip_pct, 2)}% < buy {format_decimal(config['buy_threshold_pct'], 2)}%"
+        spread_pct = candidate["spread_pct"]
+        required_profit_pct = self._auto_trade_required_profit_pct(config, spread_pct)
+        atr_pct = candidate.get("atr_pct")
+        rsi = candidate.get("rsi")
+        quote_volume = decimal_or_zero(candidate.get("quote_volume"))
+        details = [
+            f"dip {format_decimal(dip_pct, 2)}% below SMA",
+            f"spread {format_decimal(spread_pct, 3)}%",
+            f"target net-aware {format_decimal(required_profit_pct, 2)}%",
+        ]
+        if isinstance(atr_pct, Decimal):
+            details.append(f"ATR {format_decimal(atr_pct, 3)}%")
+        if isinstance(rsi, Decimal):
+            details.append(f"RSI {format_decimal(rsi, 1)}")
+        if quote_volume > ZERO:
+            details.append(f"vol {format_decimal(quote_volume, 0)} USDT")
+        details.append("trend OK" if candidate.get("trend_ok") else "trend unchecked")
+        return True, "Mean reversion buy: " + " | ".join(details)
+
+    def _backtest_candidate_from_candles(self, symbol: str, candles: list[dict], config: dict) -> dict:
+        closes = [item["close"] for item in candles]
+        close = closes[-1]
+        spread_pct = min(config["max_spread_pct"], Decimal("0.10"))
+        bid = close
+        ask = close * (Decimal("1") + spread_pct / Decimal("100"))
+        mid = (bid + ask) / Decimal("2")
+        window_size = min(config["window"], len(closes))
+        average_mid = sum(closes[-window_size:], ZERO) / Decimal(window_size)
+        dip_pct = ((average_mid - close) / average_mid * Decimal("100")) if average_mid > ZERO else ZERO
+        ready = len(closes) >= config["window"]
+        blocked_reason = ""
+        if spread_pct > config["max_spread_pct"]:
+            blocked_reason = f"spread {format_decimal(spread_pct, 3)}% > max {format_decimal(config['max_spread_pct'], 3)}%"
+        candidate = {
+            "symbol": symbol,
+            "bid": bid,
+            "ask": ask,
+            "mid": mid,
+            "spread_pct": spread_pct,
+            "history_size": len(closes),
+            "average_mid": average_mid,
+            "dip_pct": dip_pct,
+            "ready": ready,
+            "blocked_reason": blocked_reason,
+            "score": dip_pct - spread_pct - config["round_trip_fee_pct"],
+        }
+        indicator = self._indicator_snapshot_from_candles(candles)
+        return self._attach_candidate_filters(candidate, indicator, config)
 
     def _parallel_map_ordered(self, func, items: list, config: dict) -> list:
         if not config.get("parallel_enabled") or len(items) <= 1:
@@ -2819,10 +3229,24 @@ class App(tk.Tk):
                 }
             )
 
+        if candidates:
+            indicator_snapshots = self._parallel_map_ordered(
+                lambda item: self._indicator_snapshot_for_symbol(client, item, config),
+                [item["symbol"] for item in candidates],
+                config,
+            )
+            indicators_by_symbol = {item.get("symbol"): item for item in indicator_snapshots if isinstance(item, dict)}
+            for candidate in candidates:
+                self._attach_candidate_filters(candidate, indicators_by_symbol.get(candidate["symbol"]), config)
+
         candidates.sort(key=lambda item: item["score"], reverse=True)
         top = candidates[:3]
         top_text = "; ".join(
-            f"{item['symbol']} dip={format_decimal(item['dip_pct'], 2)}% spread={format_decimal(item['spread_pct'], 3)}% score={format_decimal(item['score'], 2)}"
+            f"{item['symbol']} dip={format_decimal(item['dip_pct'], 2)}% "
+            f"ATR={format_decimal(item['atr_pct'], 3) if isinstance(item.get('atr_pct'), Decimal) else 'n/a'}% "
+            f"RSI={format_decimal(item['rsi'], 1) if isinstance(item.get('rsi'), Decimal) else 'n/a'} "
+            f"vol={format_decimal(decimal_or_zero(item.get('quote_volume')), 0)} "
+            f"score={format_decimal(item['score'], 2)}"
             for item in top
         )
         if top_text:
@@ -2882,6 +3306,10 @@ class App(tk.Tk):
             "entry_reason": reason,
             "entry_order_id": buy_order_id,
             "entry_fee_estimate_quote": ZERO,
+            "peak_price": self.auto_trade_entry_price,
+            "trailing_stop_price": ZERO,
+            "break_even_armed": False,
+            "break_even_price": ZERO,
         }
 
         self._journal_order_event("order_update", symbol, reason, order, {"side": "BUY"})
@@ -3082,6 +3510,10 @@ class App(tk.Tk):
                 "entry_reason": "Autotrade balance sync",
                 "entry_order_id": "",
                 "entry_fee_estimate_quote": ZERO,
+                "peak_price": entry_price,
+                "trailing_stop_price": ZERO,
+                "break_even_armed": False,
+                "break_even_price": ZERO,
             }
             if self.auto_trade_entry_price is None:
                 self.auto_trade_entry_price = entry_price
@@ -3357,6 +3789,10 @@ class App(tk.Tk):
                 "entry_reason": self.position_entry_reason,
                 "entry_order_id": self.position_entry_order_id,
                 "entry_fee_estimate_quote": ZERO,
+                "peak_price": entry_price,
+                "trailing_stop_price": ZERO,
+                "break_even_armed": False,
+                "break_even_price": ZERO,
             }
             self.after(0, lambda s=symbol, qty=executed_qty, px=entry_price: self._update_health_position(s, qty, px))
         elif side == "SELL" and status == "FILLED":
@@ -3447,6 +3883,9 @@ class App(tk.Tk):
     def load_trade_history(self) -> None:
         self._run_async("Load trade history", self._load_trade_history_impl)
 
+    def run_backtest(self) -> None:
+        self._run_async("Run backtest", self._run_backtest_impl)
+
     def _load_trade_history_impl(self) -> None:
         client = self._client()
         symbol = self.symbol_var.get().strip().upper()
@@ -3492,6 +3931,144 @@ class App(tk.Tk):
                     f"No trades found for {s} over the last {interval}."
                 ),
             )
+
+    def _run_backtest_impl(self) -> None:
+        client = self._client()
+        config = self._validate_auto_trade_config()
+        if config["strategy_mode"] != "Mean reversion":
+            raise BinanceDemoError("Backtest currently uses the Mean reversion autotrade signal.")
+        symbol = self.symbol_var.get().strip().upper()
+        if not symbol:
+            raise BinanceDemoError("Set a symbol before running backtest.")
+
+        rows = client.get_klines(symbol, config["kline_interval"], config["kline_limit"])
+        candles = self._parse_klines(rows)
+        warmup = max(config["window"], EMA_SLOW_PERIOD, ATR_PERIOD + 1, RSI_PERIOD + 1)
+        if len(candles) <= warmup:
+            raise BinanceDemoError(
+                f"Backtest needs more klines: got {len(candles)}, need more than {warmup}."
+            )
+
+        position: dict | None = None
+        completed_trades: list[dict] = []
+        equity = ZERO
+        peak_equity = ZERO
+        max_drawdown = ZERO
+        skipped_signals = 0
+
+        for index in range(warmup, len(candles)):
+            candle = candles[index]
+            close = candle["close"]
+            spread_pct = min(config["max_spread_pct"], Decimal("0.10"))
+
+            if position is not None:
+                exit_snapshot = self._auto_trade_exit_snapshot(
+                    position,
+                    position["entry_price"],
+                    close,
+                    position["qty"],
+                    spread_pct,
+                    config,
+                )
+                floating_equity = equity + exit_snapshot["estimated_net_pnl"]
+                peak_equity = max(peak_equity, floating_equity)
+                max_drawdown = max(max_drawdown, peak_equity - floating_equity)
+                if exit_snapshot["exit_reason"]:
+                    trade = {
+                        "entry_time": position["entry_time"],
+                        "exit_time": candle["open_time"],
+                        "entry_price": position["entry_price"],
+                        "exit_price": close,
+                        "qty": position["qty"],
+                        "pnl": exit_snapshot["estimated_net_pnl"],
+                        "pnl_pct": exit_snapshot["pnl_pct"],
+                        "reason": exit_snapshot["exit_reason"],
+                    }
+                    completed_trades.append(trade)
+                    equity += exit_snapshot["estimated_net_pnl"]
+                    peak_equity = max(peak_equity, equity)
+                    position = None
+                else:
+                    continue
+
+            candidate = self._backtest_candidate_from_candles(symbol, candles[: index + 1], config)
+            triggered, reason = self._mean_reversion_signal(candidate, config)
+            if not triggered:
+                if candidate.get("blocked_reason"):
+                    skipped_signals += 1
+                continue
+
+            entry_price = candidate["ask"]
+            qty = config["capital_per_position"] / entry_price
+            position = {
+                "entry_price": entry_price,
+                "qty": qty,
+                "entry_time": candle["open_time"],
+                "entry_reason": reason,
+                "peak_price": entry_price,
+                "trailing_stop_price": ZERO,
+                "break_even_armed": False,
+                "break_even_price": ZERO,
+            }
+
+        open_pnl = ZERO
+        if position is not None:
+            last_close = candles[-1]["close"]
+            exit_snapshot = self._auto_trade_exit_snapshot(
+                position,
+                position["entry_price"],
+                last_close,
+                position["qty"],
+                min(config["max_spread_pct"], Decimal("0.10")),
+                config,
+            )
+            open_pnl = exit_snapshot["estimated_net_pnl"]
+
+        wins = [item for item in completed_trades if item["pnl"] > ZERO]
+        losses = [item for item in completed_trades if item["pnl"] < ZERO]
+        gross_profit = sum((item["pnl"] for item in wins), ZERO)
+        gross_loss = -sum((item["pnl"] for item in losses), ZERO)
+        profit_factor = (gross_profit / gross_loss) if gross_loss > ZERO else ZERO
+        win_rate = (Decimal(len(wins)) / Decimal(len(completed_trades)) * Decimal("100")) if completed_trades else ZERO
+
+        def candle_time(open_time: int) -> str:
+            if not open_time:
+                return "n/a"
+            return datetime.fromtimestamp(open_time / 1000).strftime("%Y-%m-%d %H:%M")
+
+        lines = [
+            f"symbol={symbol} | interval={config['kline_interval']} | candles={len(candles)} | capital/trade={format_decimal(config['capital_per_position'], 2)} USDT",
+            f"signals: SMA={config['window']} | EMA{EMA_FAST_PERIOD}/EMA{EMA_SLOW_PERIOD} trend={'on' if config['trend_filter_enabled'] else 'off'} | ATR={format_decimal(config['min_atr_pct'], 3)}-{format_decimal(config['max_atr_pct'], 3)}% | minVol={format_decimal(config['min_quote_volume'], 0)}",
+            f"exits: target={format_decimal(config['take_profit_pct'], 2)}% + fees/spread | stop={format_decimal(config['stop_loss_pct'], 2)}% | trail={format_decimal(config['trailing_stop_pct'], 2)}% | BE arm={format_decimal(config['break_even_profit_pct'], 2)}%",
+            "",
+            f"closed trades={len(completed_trades)} | wins={len(wins)} | losses={len(losses)} | winRate={format_decimal(win_rate, 2)}%",
+            f"net P/L={format_decimal(equity, 4)} USDT | open P/L={format_decimal(open_pnl, 4)} USDT | maxDD={format_decimal(max_drawdown, 4)} USDT | profitFactor={format_decimal(profit_factor, 2)} | blockedBars={skipped_signals}",
+            "",
+        ]
+        for trade in completed_trades[-20:]:
+            sign = "+" if trade["pnl"] >= ZERO else ""
+            lines.append(
+                f"{candle_time(trade['entry_time'])} -> {candle_time(trade['exit_time'])} | "
+                f"entry={format_decimal(trade['entry_price'], 4)} | exit={format_decimal(trade['exit_price'], 4)} | "
+                f"{trade['reason']} | P/L={sign}{format_decimal(trade['pnl'], 4)} ({format_decimal(trade['pnl_pct'], 2)}%)"
+            )
+        if position is not None:
+            sign = "+" if open_pnl >= ZERO else ""
+            lines.append(
+                f"open simulated position | entry={format_decimal(position['entry_price'], 4)} | "
+                f"last={format_decimal(candles[-1]['close'], 4)} | P/L={sign}{format_decimal(open_pnl, 4)}"
+            )
+        if not completed_trades and position is None:
+            lines.append("No entries matched the current live signal filters.")
+
+        report = "\n".join(lines)
+        self.after(
+            0,
+            lambda trades=len(completed_trades), pnl=equity, s=symbol: self.log_ok(
+                f"Backtest complete: {s} | trades={trades} | net={format_decimal(pnl, 4)} USDT"
+            ),
+        )
+        self.after(0, lambda text=report, s=symbol: self.log_block(f"Backtest | {s}", text))
 
     def toggle_auto_refresh(self) -> None:
         if self.auto_refresh_enabled.get():
@@ -3609,6 +4186,9 @@ class App(tk.Tk):
                         f"Mode={mode_text} | fee={format_decimal(config['fee_pct'], 3)}%/side | "
                         f"min net={format_decimal(config['min_net_profit_pct'], 2)}% | max spread={format_decimal(config['max_spread_pct'], 3)}% | "
                         f"max positions={config['max_positions']} | capital/position={format_decimal(config['capital_per_position'], 2)} USDT | "
+                        f"klines={config['kline_interval']}x{config['kline_limit']} | minVol={format_decimal(config['min_quote_volume'], 0)} | "
+                        f"ATR={format_decimal(config['min_atr_pct'], 3)}-{format_decimal(config['max_atr_pct'], 3)}% | "
+                        f"trail={format_decimal(config['trailing_stop_pct'], 2)}% | BE={format_decimal(config['break_even_profit_pct'], 2)}% | "
                         f"parallel={'on' if config['parallel_enabled'] else 'off'}({config['parallel_workers']} workers). Demo only."
                     )
                 self._set_auto_trade_last_check("Last check: waiting for first cycle", PNL_COLOR_NEUTRAL)
@@ -3761,29 +4341,37 @@ class App(tk.Tk):
                 entry_qty = free_qty
                 position_state["qty"] = entry_qty
 
-            pnl_pct = ((bid - entry_price) / entry_price * Decimal("100")) if entry_price > ZERO else ZERO
-            estimated_net_pnl, entry_fee_estimate, exit_fee_estimate = self._auto_trade_estimated_net_pnl(
+            exit_snapshot = self._auto_trade_exit_snapshot(
+                position_state,
                 entry_price,
                 bid,
                 min(free_qty, entry_qty),
+                spread_pct,
                 config,
             )
+            pnl_pct = exit_snapshot["pnl_pct"]
+            estimated_net_pnl = exit_snapshot["estimated_net_pnl"]
+            entry_fee_estimate = exit_snapshot["entry_fee_estimate"]
+            exit_fee_estimate = exit_snapshot["exit_fee_estimate"]
+            required_profit_pct = exit_snapshot["required_profit_pct"]
+            peak_price = exit_snapshot["peak_price"]
+            trailing_stop_price = exit_snapshot["trailing_stop_price"]
+            break_even_armed = exit_snapshot["break_even_armed"]
             portfolio_net += estimated_net_pnl
             status_color = PNL_COLOR_PROFIT if estimated_net_pnl > ZERO else PNL_COLOR_LOSS if estimated_net_pnl < ZERO else PNL_COLOR_NEUTRAL
             self._publish_auto_trade_heartbeat("hold", symbol, mid, average_mid, dip_pct, status_color)
             self.after(
                 0,
-                lambda s=symbol, qty=free_qty, entry=entry_price, b=bid, pct=pnl_pct, net=estimated_net_pnl, need=required_profit_pct: self.log_pnl(
-                    f"[AUTO-TRADE] {s} HOLD qty={format_decimal(qty)} | entry={format_decimal(entry, 2)} | bid={format_decimal(b, 2)} | gross={format_decimal(pct, 2)}% | net≈{format_decimal(net, 2)} | target={format_decimal(need, 2)}%",
+                lambda s=symbol, qty=free_qty, entry=entry_price, b=bid, pct=pnl_pct, net=estimated_net_pnl, need=required_profit_pct, peak=peak_price, trail=trailing_stop_price, be=break_even_armed: self.log_pnl(
+                    f"[AUTO-TRADE] {s} HOLD qty={format_decimal(qty)} | entry={format_decimal(entry, 2)} | "
+                    f"bid={format_decimal(b, 2)} | gross={format_decimal(pct, 2)}% | net≈{format_decimal(net, 2)} | "
+                    f"target={format_decimal(need, 2)}% | peak={format_decimal(peak, 2)} | "
+                    f"trail={format_decimal(trail, 2) if trail > ZERO else 'off'} | BE={'on' if be else 'off'}",
                     net,
                 ),
             )
 
-            exit_reason = ""
-            if pnl_pct >= required_profit_pct and estimated_net_pnl > ZERO:
-                exit_reason = "fee-aware take-profit"
-            elif pnl_pct <= -config["stop_loss_pct"]:
-                exit_reason = "stop-loss"
+            exit_reason = exit_snapshot["exit_reason"]
             if not exit_reason:
                 continue
 
@@ -3862,6 +4450,10 @@ class App(tk.Tk):
                 continue
             if candidate["blocked_reason"] or not candidate["ready"]:
                 continue
+            if strategy_mode == "Mean reversion":
+                should_enter, _reason = self._mean_reversion_signal(candidate, config)
+                if not should_enter:
+                    continue
             entry_check_symbols.append(symbol)
         entry_open_orders = {
             item["symbol"]: item
@@ -3910,12 +4502,9 @@ class App(tk.Tk):
                     continue
                 signal_reason = f"Price trigger hit: {trigger_text} | current={format_decimal(trigger_price, 2)}"
             else:
-                if dip_pct < config["buy_threshold_pct"]:
+                triggered, signal_reason = self._mean_reversion_signal(candidate, config)
+                if not triggered:
                     continue
-                signal_reason = (
-                    f"Mean reversion buy: dip {format_decimal(dip_pct, 2)}% below SMA | "
-                    f"spread {format_decimal(spread_pct, 3)}% | target net-aware {format_decimal(required_profit_pct, 2)}%"
-                )
 
             self._enforce_risk_limits(client, symbol)
             quantity = (
