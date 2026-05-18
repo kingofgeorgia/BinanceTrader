@@ -1083,10 +1083,12 @@ class App(tk.Tk):
 
     def _center_window(self) -> None:
         self.update_idletasks()
-        width = max(self.winfo_width(), 1280)
-        height = max(self.winfo_height(), 960)
+        width = max(self.winfo_width(), self.winfo_reqwidth(), 1540)
+        height = max(self.winfo_height(), self.winfo_reqheight(), 960)
         screen_width = self.winfo_screenwidth()
         screen_height = self.winfo_screenheight()
+        width = min(width, screen_width)
+        height = min(height, screen_height)
         x = max((screen_width - width) // 2, 0)
         y = max((screen_height - height) // 2, 0)
         self.geometry(f"{width}x{height}+{x}+{y}")
