@@ -244,7 +244,10 @@ def decimal_or_zero(value: str | int | float | None) -> Decimal:
 def format_decimal(value: Decimal, places: int = 8) -> str:
     quant = Decimal("1").scaleb(-places)
     try:
-        text = format(value.quantize(quant, rounding=ROUND_DOWN), "f")
+        rounded = value.quantize(quant, rounding=ROUND_DOWN)
+        if rounded == ZERO:
+            rounded = ZERO
+        text = format(rounded, "f")
     except InvalidOperation:
         text = format(value, "f")
     if "." in text:
@@ -2839,6 +2842,16 @@ class App(tk.Tk):
                 continue
             if position["free_qty"] <= ZERO:
                 continue
+            is_sellable, sell_qty, _base_asset, _details, dust_reason = self._sellable_balance_status(client, symbol)
+            if not is_sellable:
+                self.auto_trade_positions.pop(symbol, None)
+                self.after(
+                    0,
+                    lambda s=symbol, qty=position["free_qty"], reason=dust_reason: self.log_warn(
+                        f"[AUTO-TRADE] Ignoring dust balance on {s}: qty={format_decimal(qty)} | {reason}"
+                    ),
+                )
+                continue
             existing_position = self.auto_trade_positions.get(symbol)
             if existing_position:
                 existing_position["qty"] = position["free_qty"]
@@ -2906,11 +2919,22 @@ class App(tk.Tk):
         self._validate_quantity_filters(sell_qty, qty_filters, f"{base_asset} sell quantity")
 
         return format_decimal(sell_qty), base_asset, {
+            "symbol_info": symbol_info,
             "free_qty": free_qty,
             "locked_qty": locked_qty,
             "step_size": step_size,
             "min_qty": min_qty,
         }
+
+    def _sellable_balance_status(self, client: BinanceDemoClient, symbol: str) -> tuple[bool, str, str, dict, str]:
+        try:
+            sell_qty, base_asset, details = self._sellable_quantity_for_symbol(client, symbol)
+            bid, _ask, _mid = self._current_market_prices(client, symbol)
+            notional = decimal_or_zero(sell_qty) * bid
+            self._validate_notional_filters(details["symbol_info"], notional, is_market=True)
+            return True, sell_qty, base_asset, details, ""
+        except Exception as exc:
+            return False, "", "", {}, str(exc)
 
     def _build_pnl_snapshot(self, client: BinanceDemoClient, order: dict) -> dict | None:
         symbol = order.get("symbol", "")
@@ -3481,6 +3505,18 @@ class App(tk.Tk):
                 self.auto_trade_positions.pop(symbol, None)
                 self.after(0, lambda s=symbol: self.log_warn(f"[AUTO-TRADE] {s} removed from portfolio: no free balance."))
                 continue
+            is_sellable, sell_qty_for_exit, base_asset_for_exit, sell_details, dust_reason = self._sellable_balance_status(
+                client, symbol
+            )
+            if not is_sellable:
+                self.auto_trade_positions.pop(symbol, None)
+                self.after(
+                    0,
+                    lambda s=symbol, qty=free_qty, reason=dust_reason: self.log_warn(
+                        f"[AUTO-TRADE] {s} removed from portfolio as dust: qty={format_decimal(qty)} | {reason}"
+                    ),
+                )
+                continue
 
             entry_price = decimal_or_zero(position_state.get("entry_price"))
             entry_qty = decimal_or_zero(position_state.get("qty"))
@@ -3523,7 +3559,7 @@ class App(tk.Tk):
                 self.after(0, lambda s=symbol, count=len(open_orders): self.log_warn(f"[AUTO-TRADE] {s} exit paused: {count} open order(s)."))
                 continue
 
-            sell_qty, base_asset, details = self._sellable_quantity_for_symbol(client, symbol)
+            sell_qty, base_asset, details = sell_qty_for_exit, base_asset_for_exit, sell_details
             self._validate_order_filters(client, symbol, sell_qty, "SELL", "MARKET")
             if execution_mode == "Manual":
                 self.after(
