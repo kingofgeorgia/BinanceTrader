@@ -276,6 +276,17 @@ def format_decimal(value: Decimal, places: int = 8) -> str:
     return text or "0"
 
 
+def format_decimal_fixed(value: Decimal, places: int = 4) -> str:
+    quant = Decimal("1").scaleb(-places)
+    try:
+        rounded = value.quantize(quant, rounding=ROUND_DOWN)
+    except InvalidOperation:
+        rounded = value
+    if rounded == ZERO:
+        rounded = ZERO
+    return f"{rounded:.{places}f}"
+
+
 def round_step_down(value: Decimal, step: Decimal) -> Decimal:
     if step <= 0:
         return value
@@ -542,7 +553,7 @@ class App(tk.Tk):
         self.health_risk_var = tk.StringVar(value="Risk: filters enabled")
         self.orders_summary_open_var = tk.StringVar(value="Открытые ордера: ?")
         self.orders_summary_filled_var = tk.StringVar(value="Выполнено ордеров: 0")
-        self.orders_summary_profit_var = tk.StringVar(value="Заработок: 0 USDT")
+        self.orders_summary_profit_var = tk.StringVar(value="Заработок: 0.0000 USDT")
         self.current_open_orders_count = 0
         self.open_orders_by_symbol: dict[str, int] = {}
         self.show_secret_var = tk.BooleanVar(value=False)
@@ -729,8 +740,8 @@ class App(tk.Tk):
         summary = ttk.LabelFrame(left, text="Мониторинг сделки", padding=12)
         summary.pack(fill="x", pady=(12, 0))
 
-        orders_summary = ttk.LabelFrame(left, text="Сводка ордеров", padding=12)
-        orders_summary.pack(fill="x", pady=(12, 0))
+        orders_summary = ttk.LabelFrame(right, text="Сводка ордеров", padding=12)
+        orders_summary.pack(fill="x", padx=(12, 0), pady=(0, 12))
         orders_summary.columnconfigure(0, weight=1)
         orders_summary.columnconfigure(1, weight=1)
         orders_summary.columnconfigure(2, weight=1)
@@ -1218,7 +1229,7 @@ class App(tk.Tk):
         self.orders_summary_open_var.set(f"Открытые ордера: {self.current_open_orders_count}")
         self.orders_summary_filled_var.set(f"Выполнено ордеров: {self.today_fill_count}")
         sign = "+" if self.today_realized_pnl > ZERO else ""
-        self.orders_summary_profit_var.set(f"Заработок: {sign}{format_decimal(self.today_realized_pnl, 2)} USDT")
+        self.orders_summary_profit_var.set(f"Заработок: {sign}{format_decimal_fixed(self.today_realized_pnl, 4)} USDT")
         if hasattr(self, "orders_summary_profit_label"):
             color = PNL_COLOR_NEUTRAL
             if self.today_realized_pnl > ZERO:
