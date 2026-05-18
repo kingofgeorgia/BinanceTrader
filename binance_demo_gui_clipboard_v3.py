@@ -26,6 +26,7 @@ DEMO_WS_API_BASE_URL = "wss://demo-ws-api.binance.com/ws-api/v3"
 TIMEOUT_SECONDS = 15
 WEBSOCKET_RECONNECT_DELAY_SECONDS = 5
 ZERO = Decimal("0")
+MIN_RESTORED_POSITION_NOTIONAL = Decimal("1")
 KEYSTORE_PATH = Path(__file__).resolve().parent / "binance_demo_keys.json"
 
 PNL_COLOR_PROFIT = "#0a7f2e"
@@ -1496,6 +1497,15 @@ class App(tk.Tk):
                 entry_price = decimal_or_zero(position.get("entry_price"))
                 qty = decimal_or_zero(position.get("qty"))
                 if not normalized_symbol or entry_price <= ZERO or qty <= ZERO:
+                    continue
+                notional = entry_price * qty
+                if notional < MIN_RESTORED_POSITION_NOTIONAL:
+                    self.after(
+                        0,
+                        lambda s=normalized_symbol, n=notional: self.log_warn(
+                            f"Skipped restored dust position {s}: notional≈{format_decimal(n, 4)} USDT."
+                        ),
+                    )
                     continue
                 self.auto_trade_positions[normalized_symbol] = {
                     "entry_price": entry_price,
