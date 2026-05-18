@@ -8,6 +8,7 @@ import threading
 import time
 import tkinter as tk
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from pathlib import Path
@@ -522,6 +523,8 @@ class App(tk.Tk):
         self.auto_trade_max_spread_var = tk.StringVar(value="0.20")
         self.auto_trade_max_positions_var = tk.StringVar(value="3")
         self.auto_trade_capital_per_position_var = tk.StringVar(value="100")
+        self.auto_trade_parallel_var = tk.BooleanVar(value=True)
+        self.auto_trade_workers_var = tk.StringVar(value="4")
         self.auto_trade_status_var = tk.StringVar(value="Autotrade: OFF")
         self.auto_trade_last_check_var = tk.StringVar(value="Last check: never")
         self.strategy_mode_var = tk.StringVar(value="Mean reversion")
@@ -847,8 +850,19 @@ class App(tk.Tk):
             row=3, column=7, sticky="w", pady=4
         )
 
+        ttk.Checkbutton(
+            autotrade,
+            text="Parallel scan",
+            variable=self.auto_trade_parallel_var,
+        ).grid(row=4, column=0, sticky="w", pady=(10, 0))
+
+        ttk.Label(autotrade, text="Workers").grid(row=4, column=1, sticky="e", padx=(8, 8), pady=(10, 0))
+        tk.Entry(autotrade, textvariable=self.auto_trade_workers_var, width=10, font=("Consolas", 10)).grid(
+            row=4, column=2, sticky="w", pady=(10, 0)
+        )
+
         auto_trade_buttons = ttk.Frame(autotrade)
-        auto_trade_buttons.grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        auto_trade_buttons.grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         self.start_auto_trade_button = ttk.Button(
             auto_trade_buttons,
@@ -871,7 +885,7 @@ class App(tk.Tk):
             anchor="w",
             fg=PNL_COLOR_NEUTRAL,
         )
-        self.auto_trade_status_label.grid(row=4, column=2, columnspan=6, sticky="ew", padx=(16, 0), pady=(10, 0))
+        self.auto_trade_status_label.grid(row=5, column=2, columnspan=6, sticky="ew", padx=(16, 0), pady=(10, 0))
         self.auto_trade_last_check_label = tk.Label(
             autotrade,
             textvariable=self.auto_trade_last_check_var,
@@ -879,7 +893,7 @@ class App(tk.Tk):
             anchor="w",
             fg=PNL_COLOR_NEUTRAL,
         )
-        self.auto_trade_last_check_label.grid(row=5, column=0, columnspan=8, sticky="ew", pady=(8, 0))
+        self.auto_trade_last_check_label.grid(row=6, column=0, columnspan=8, sticky="ew", pady=(8, 0))
         self._sync_auto_trade_buttons()
 
         strategy = ttk.LabelFrame(left, text="Strategy & Execution", padding=12)
@@ -2332,6 +2346,11 @@ class App(tk.Tk):
             "capital_per_position": self._validate_decimal_field(
                 self.auto_trade_capital_per_position_var.get(), "USDT/position"
             ),
+            "parallel_enabled": bool(self.auto_trade_parallel_var.get()),
+            "parallel_workers": min(
+                self._validate_int_field(self.auto_trade_workers_var.get(), "Workers", minimum=1),
+                8,
+            ),
             "strategy_mode": self._validate_strategy_mode(),
             "execution_mode": self._validate_execution_mode(),
         }
@@ -2669,6 +2688,65 @@ class App(tk.Tk):
         dip_pct = ((average_mid - mid) / average_mid * Decimal("100")) if average_mid > ZERO else ZERO
         return history, average_mid, dip_pct
 
+    def _parallel_map_ordered(self, func, items: list, config: dict) -> list:
+        if not config.get("parallel_enabled") or len(items) <= 1:
+            return [func(item) for item in items]
+        workers = max(1, min(int(config.get("parallel_workers", 4)), 8, len(items)))
+        results: list = [None] * len(items)
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="autotrade") as executor:
+            future_to_index = {executor.submit(func, item): index for index, item in enumerate(items)}
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                results[index] = future.result()
+        return results
+
+    def _fetch_book_ticker_for_symbol(self, client: BinanceDemoClient, symbol: str) -> tuple[str, dict | None, str]:
+        try:
+            return symbol, client.get_book_ticker(symbol), ""
+        except Exception as exc:
+            return symbol, None, str(exc)
+
+    def _position_check_snapshot(self, client: BinanceDemoClient, symbol: str) -> dict:
+        try:
+            bid, ask, mid = self._current_market_prices(client, symbol)
+            balance = self._position_balance_for_symbol(client, symbol)
+            is_sellable, sell_qty, base_asset, sell_details, dust_reason = self._sellable_balance_status(client, symbol)
+            open_orders: list = []
+            open_orders_error = ""
+            try:
+                open_orders = client.get_open_orders_retry(symbol=symbol)
+            except BinanceDemoError as exc:
+                open_orders_error = str(exc)
+            return {
+                "symbol": symbol,
+                "ok": True,
+                "bid": bid,
+                "ask": ask,
+                "mid": mid,
+                "balance": balance,
+                "is_sellable": is_sellable,
+                "sell_qty": sell_qty,
+                "base_asset": base_asset,
+                "sell_details": sell_details,
+                "dust_reason": dust_reason,
+                "open_orders": open_orders,
+                "open_orders_error": open_orders_error,
+                "error": "",
+            }
+        except Exception as exc:
+            return {"symbol": symbol, "ok": False, "error": str(exc)}
+
+    def _open_orders_check_snapshot(self, client: BinanceDemoClient, symbol: str) -> dict:
+        try:
+            return {
+                "symbol": symbol,
+                "ok": True,
+                "open_orders": client.get_open_orders_retry(symbol=symbol),
+                "error": "",
+            }
+        except Exception as exc:
+            return {"symbol": symbol, "ok": False, "open_orders": [], "error": str(exc)}
+
     def _select_auto_trade_candidate(self, client: BinanceDemoClient, config: dict) -> dict:
         symbols = config["scan_symbols"] if config["auto_select"] else [self.symbol_var.get().strip().upper()]
         candidates = self._scan_auto_trade_candidates(client, config, symbols)
@@ -2699,9 +2777,24 @@ class App(tk.Tk):
         except Exception:
             books_by_symbol = {}
 
+        missing_symbols = [symbol for symbol in symbols if symbol not in books_by_symbol]
+        if missing_symbols:
+            fetched_books = self._parallel_map_ordered(
+                lambda item: self._fetch_book_ticker_for_symbol(client, item),
+                missing_symbols,
+                config,
+            )
+            for symbol, book, error in fetched_books:
+                if book is not None:
+                    books_by_symbol[symbol] = book
+                elif error:
+                    self.after(0, lambda s=symbol, e=error: self.log_warn(f"[AUTO-TRADE] scan skipped {s}: {e}"))
+
         candidates: list[dict] = []
         for symbol in symbols:
-            book = books_by_symbol.get(symbol) or client.get_book_ticker(symbol)
+            book = books_by_symbol.get(symbol)
+            if not book:
+                continue
             bid, ask, mid = self._market_prices(book)
             spread_pct = self._spread_pct(bid, ask, mid)
             history, average_mid, dip_pct = self._append_auto_trade_price(symbol, mid, config["window"])
@@ -3515,7 +3608,8 @@ class App(tk.Tk):
                         f"Autotrade mean reversion uses MARKET BUY / MARKET SELL on the Binance demo API. "
                         f"Mode={mode_text} | fee={format_decimal(config['fee_pct'], 3)}%/side | "
                         f"min net={format_decimal(config['min_net_profit_pct'], 2)}% | max spread={format_decimal(config['max_spread_pct'], 3)}% | "
-                        f"max positions={config['max_positions']} | capital/position={format_decimal(config['capital_per_position'], 2)} USDT. Demo only."
+                        f"max positions={config['max_positions']} | capital/position={format_decimal(config['capital_per_position'], 2)} USDT | "
+                        f"parallel={'on' if config['parallel_enabled'] else 'off'}({config['parallel_workers']} workers). Demo only."
                     )
                 self._set_auto_trade_last_check("Last check: waiting for first cycle", PNL_COLOR_NEUTRAL)
                 self._schedule_next_auto_trade(initial=True)
@@ -3610,23 +3704,44 @@ class App(tk.Tk):
         portfolio_net = ZERO
         closed_count = 0
         open_symbols = list(self.auto_trade_positions.keys())
+        position_snapshots = {
+            item["symbol"]: item
+            for item in self._parallel_map_ordered(
+                lambda item: self._position_check_snapshot(client, item),
+                open_symbols,
+                config,
+            )
+        }
         for symbol in open_symbols:
             position_state = self.auto_trade_positions.get(symbol)
             if not position_state:
                 continue
-            bid, ask, mid = self._current_market_prices(client, symbol)
+            snapshot = position_snapshots.get(symbol, {"ok": False, "error": "position snapshot missing"})
+            if not snapshot.get("ok"):
+                self.after(
+                    0,
+                    lambda s=symbol, e=snapshot.get("error", "unknown error"): self.log_warn(
+                        f"[AUTO-TRADE] {s} position check skipped: {e}"
+                    ),
+                )
+                continue
+            bid = snapshot["bid"]
+            ask = snapshot["ask"]
+            mid = snapshot["mid"]
             history, average_mid, dip_pct = self._append_auto_trade_price(symbol, mid, config["window"])
             spread_pct = self._spread_pct(bid, ask, mid)
             required_profit_pct = self._auto_trade_required_profit_pct(config, spread_pct)
-            balance = self._position_balance_for_symbol(client, symbol)
+            balance = snapshot["balance"]
             free_qty = balance["free_qty"]
             if free_qty <= ZERO:
                 self.auto_trade_positions.pop(symbol, None)
                 self.after(0, lambda s=symbol: self.log_warn(f"[AUTO-TRADE] {s} removed from portfolio: no free balance."))
                 continue
-            is_sellable, sell_qty_for_exit, base_asset_for_exit, sell_details, dust_reason = self._sellable_balance_status(
-                client, symbol
-            )
+            is_sellable = bool(snapshot["is_sellable"])
+            sell_qty_for_exit = snapshot["sell_qty"]
+            base_asset_for_exit = snapshot["base_asset"]
+            sell_details = snapshot["sell_details"]
+            dust_reason = snapshot["dust_reason"]
             if not is_sellable:
                 self.auto_trade_positions.pop(symbol, None)
                 self.after(
@@ -3672,11 +3787,15 @@ class App(tk.Tk):
             if not exit_reason:
                 continue
 
-            try:
-                open_orders = client.get_open_orders_retry(symbol=symbol)
-            except BinanceDemoError as exc:
-                self.after(0, lambda s=symbol, e=exc: self.log_warn(f"[AUTO-TRADE] {s} exit open-orders check timed out/skipped: {e}"))
+            if snapshot["open_orders_error"]:
+                self.after(
+                    0,
+                    lambda s=symbol, e=snapshot["open_orders_error"]: self.log_warn(
+                        f"[AUTO-TRADE] {s} exit open-orders check timed out/skipped: {e}"
+                    ),
+                )
                 continue
+            open_orders = snapshot["open_orders"]
             self.after(0, lambda count=len(open_orders), s=symbol: self._update_health_orders(count, s))
             if open_orders:
                 self.after(0, lambda s=symbol, count=len(open_orders): self.log_warn(f"[AUTO-TRADE] {s} exit paused: {count} open order(s)."))
@@ -3734,6 +3853,25 @@ class App(tk.Tk):
         if strategy_mode == "Price trigger":
             candidates = [item for item in candidates if item["symbol"] == self.symbol_var.get().strip().upper()]
 
+        entry_check_symbols: list[str] = []
+        for candidate in candidates:
+            if len(entry_check_symbols) >= entries_left:
+                break
+            symbol = candidate["symbol"]
+            if symbol in self.auto_trade_positions:
+                continue
+            if candidate["blocked_reason"] or not candidate["ready"]:
+                continue
+            entry_check_symbols.append(symbol)
+        entry_open_orders = {
+            item["symbol"]: item
+            for item in self._parallel_map_ordered(
+                lambda item: self._open_orders_check_snapshot(client, item),
+                entry_check_symbols,
+                config,
+            )
+        }
+
         for candidate in candidates:
             if entries_left <= 0:
                 break
@@ -3742,11 +3880,17 @@ class App(tk.Tk):
                 continue
             if candidate["blocked_reason"] or not candidate["ready"]:
                 continue
-            try:
-                open_orders = client.get_open_orders_retry(symbol=symbol)
-            except BinanceDemoError as exc:
-                self.after(0, lambda s=symbol, e=exc: self.log_warn(f"[AUTO-TRADE] {s} entry skipped: open-orders check failed after retries: {e}"))
+            open_order_snapshot = entry_open_orders.get(symbol)
+            if not open_order_snapshot or not open_order_snapshot.get("ok"):
+                error = open_order_snapshot.get("error", "open-orders check missing") if open_order_snapshot else "open-orders check missing"
+                self.after(
+                    0,
+                    lambda s=symbol, e=error: self.log_warn(
+                        f"[AUTO-TRADE] {s} entry skipped: open-orders check failed after retries: {e}"
+                    ),
+                )
                 continue
+            open_orders = open_order_snapshot["open_orders"]
             if open_orders:
                 self.after(0, lambda s=symbol, count=len(open_orders): self.log_warn(f"[AUTO-TRADE] {s} entry skipped: {count} open order(s)."))
                 continue
