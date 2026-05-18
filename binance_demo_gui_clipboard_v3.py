@@ -1229,6 +1229,67 @@ class App(tk.Tk):
             return self._find_filter(symbol_info, "MARKET_LOT_SIZE") or self._find_filter(symbol_info, "LOT_SIZE")
         return self._find_filter(symbol_info, "LOT_SIZE")
 
+    def _quantity_filters_for_order(self, symbol_info: dict, order_type: str) -> list[dict]:
+        filters: list[dict] = []
+        lot_filter = self._find_filter(symbol_info, "LOT_SIZE")
+        market_filter = self._find_filter(symbol_info, "MARKET_LOT_SIZE")
+        if order_type.upper() == "MARKET":
+            for item in (lot_filter, market_filter):
+                if item and item not in filters:
+                    filters.append(item)
+        elif lot_filter:
+            filters.append(lot_filter)
+        return filters
+
+    def _quantity_filter_bounds(self, filters: list[dict]) -> tuple[Decimal, Decimal, Decimal]:
+        min_qty = ZERO
+        max_qty = ZERO
+        step_size = ZERO
+        for item in filters:
+            item_min = decimal_or_zero(item.get("minQty"))
+            item_max = decimal_or_zero(item.get("maxQty"))
+            item_step = decimal_or_zero(item.get("stepSize"))
+            if item_min > min_qty:
+                min_qty = item_min
+            if item_max > ZERO:
+                max_qty = item_max if max_qty <= ZERO else min(max_qty, item_max)
+            if item_step > step_size:
+                step_size = item_step
+        return min_qty, max_qty, step_size
+
+    def _round_quantity_for_filters(self, quantity: Decimal, filters: list[dict]) -> Decimal:
+        _min_qty, max_qty, _step_size = self._quantity_filter_bounds(filters)
+        if max_qty > ZERO:
+            quantity = min(quantity, max_qty)
+        steps = sorted(
+            (decimal_or_zero(item.get("stepSize")) for item in filters),
+            reverse=True,
+        )
+        steps = [step for step in steps if step > ZERO]
+        for _ in range(max(1, len(steps))):
+            previous = quantity
+            for step in steps:
+                quantity = round_step_down(quantity, step)
+            if quantity == previous:
+                break
+        return quantity
+
+    def _validate_quantity_filters(self, quantity: Decimal, filters: list[dict], field_name: str = "Quantity") -> None:
+        for item in filters:
+            filter_type = str(item.get("filterType", "LOT_SIZE"))
+            min_qty = decimal_or_zero(item.get("minQty"))
+            max_qty = decimal_or_zero(item.get("maxQty"))
+            step_size = decimal_or_zero(item.get("stepSize"))
+            if min_qty > ZERO and quantity < min_qty:
+                raise BinanceDemoError(
+                    f"{field_name} {format_decimal(quantity)} is below {filter_type}.minQty {format_decimal(min_qty)}."
+                )
+            if max_qty > ZERO and quantity > max_qty:
+                raise BinanceDemoError(
+                    f"{field_name} {format_decimal(quantity)} exceeds {filter_type}.maxQty {format_decimal(max_qty)}."
+                )
+            self._ensure_step_alignment(quantity, step_size, f"{field_name} ({filter_type})")
+
     def _calculate_risk_position_size(
         self,
         client: BinanceDemoClient,
@@ -1244,19 +1305,11 @@ class App(tk.Tk):
         raw_qty = allowed_loss / stop_distance
         max_affordable_qty = config["deposit"] / entry_price
         bounded_qty = min(raw_qty, max_affordable_qty)
-        qty_filter = self._quantity_filter_for_order(symbol_info, order_type)
-        min_qty = decimal_or_zero(qty_filter.get("minQty")) if qty_filter else ZERO
-        max_qty = decimal_or_zero(qty_filter.get("maxQty")) if qty_filter else ZERO
-        step_size = decimal_or_zero(qty_filter.get("stepSize")) if qty_filter else ZERO
-        if max_qty > ZERO:
-            bounded_qty = min(bounded_qty, max_qty)
-        rounded_qty = round_step_down(bounded_qty, step_size) if step_size > ZERO else bounded_qty
+        qty_filters = self._quantity_filters_for_order(symbol_info, order_type)
+        rounded_qty = self._round_quantity_for_filters(bounded_qty, qty_filters)
         if rounded_qty <= ZERO:
             raise BinanceDemoError("Risk sizing rounded quantity down to zero.")
-        if min_qty > ZERO and rounded_qty < min_qty:
-            raise BinanceDemoError(
-                f"Risk quantity {format_decimal(rounded_qty)} is below minQty {format_decimal(min_qty)}."
-            )
+        self._validate_quantity_filters(rounded_qty, qty_filters, "Risk quantity")
         notional = rounded_qty * entry_price
         self._validate_notional_filters(symbol_info, notional, is_market=order_type.upper() == "MARKET")
 
@@ -2239,16 +2292,8 @@ class App(tk.Tk):
         is_market = order_type.upper() == "MARKET"
 
         if is_market:
-            market_filter = self._find_filter(symbol_info, "MARKET_LOT_SIZE") or self._find_filter(symbol_info, "LOT_SIZE")
-            if market_filter:
-                min_qty = decimal_or_zero(market_filter.get("minQty"))
-                max_qty = decimal_or_zero(market_filter.get("maxQty"))
-                step_size = decimal_or_zero(market_filter.get("stepSize"))
-                if min_qty > ZERO and quantity < min_qty:
-                    raise BinanceDemoError(f"Quantity {format_decimal(quantity)} is below minQty {format_decimal(min_qty)}.")
-                if max_qty > ZERO and quantity > max_qty:
-                    raise BinanceDemoError(f"Quantity {format_decimal(quantity)} exceeds maxQty {format_decimal(max_qty)}.")
-                self._ensure_step_alignment(quantity, step_size, "Quantity")
+            quantity_filters = self._quantity_filters_for_order(symbol_info, "MARKET")
+            self._validate_quantity_filters(quantity, quantity_filters, "Quantity")
 
             bid, ask, _ = self._current_market_prices(client, symbol)
             reference_price = ask if side.upper() == "BUY" else bid
@@ -2267,16 +2312,8 @@ class App(tk.Tk):
                     raise BinanceDemoError(f"Price {format_decimal(price, 2)} exceeds maxPrice {format_decimal(max_price, 2)}.")
                 self._ensure_step_alignment(price, tick_size, "Price")
 
-            lot_filter = self._find_filter(symbol_info, "LOT_SIZE")
-            if lot_filter:
-                min_qty = decimal_or_zero(lot_filter.get("minQty"))
-                max_qty = decimal_or_zero(lot_filter.get("maxQty"))
-                step_size = decimal_or_zero(lot_filter.get("stepSize"))
-                if min_qty > ZERO and quantity < min_qty:
-                    raise BinanceDemoError(f"Quantity {format_decimal(quantity)} is below minQty {format_decimal(min_qty)}.")
-                if max_qty > ZERO and quantity > max_qty:
-                    raise BinanceDemoError(f"Quantity {format_decimal(quantity)} exceeds maxQty {format_decimal(max_qty)}.")
-                self._ensure_step_alignment(quantity, step_size, "Quantity")
+            quantity_filters = self._quantity_filters_for_order(symbol_info, "LIMIT")
+            self._validate_quantity_filters(quantity, quantity_filters, "Quantity")
 
             notional = price * quantity
 
@@ -2486,21 +2523,11 @@ class App(tk.Tk):
         if entry_price <= ZERO:
             raise BinanceDemoError("Entry price must be greater than zero.")
         symbol_info = client.get_exchange_info(symbol)
-        qty_filter = self._quantity_filter_for_order(symbol_info, "MARKET")
-        step_size = decimal_or_zero(qty_filter.get("stepSize")) if qty_filter else ZERO
-        min_qty = decimal_or_zero(qty_filter.get("minQty")) if qty_filter else ZERO
-        max_qty = decimal_or_zero(qty_filter.get("maxQty")) if qty_filter else ZERO
-        qty = capital / entry_price
-        if max_qty > ZERO:
-            qty = min(qty, max_qty)
-        if step_size > ZERO:
-            qty = round_step_down(qty, step_size)
+        qty_filters = self._quantity_filters_for_order(symbol_info, "MARKET")
+        qty = self._round_quantity_for_filters(capital / entry_price, qty_filters)
         if qty <= ZERO:
             raise BinanceDemoError(f"Capital per position is too small for {symbol}.")
-        if min_qty > ZERO and qty < min_qty:
-            raise BinanceDemoError(
-                f"Capital per position gives qty {format_decimal(qty)} below minQty {format_decimal(min_qty)} for {symbol}."
-            )
+        self._validate_quantity_filters(qty, qty_filters, f"{symbol} quantity")
         self._validate_notional_filters(symbol_info, qty * entry_price, is_market=True)
         return format_decimal(qty)
 
@@ -2864,14 +2891,9 @@ class App(tk.Tk):
                 f"Недостаточно свободного баланса для SELL. {base_asset}: free={format_decimal(free_qty)}, locked={format_decimal(locked_qty)}"
             )
 
-        step_size = self._extract_filter_value(symbol_info, "MARKET_LOT_SIZE", "stepSize", "0")
-        min_qty = self._extract_filter_value(symbol_info, "MARKET_LOT_SIZE", "minQty", "0")
-        if step_size <= ZERO:
-            step_size = self._extract_filter_value(symbol_info, "LOT_SIZE", "stepSize", "0")
-        if min_qty <= ZERO:
-            min_qty = self._extract_filter_value(symbol_info, "LOT_SIZE", "minQty", "0")
-
-        sell_qty = round_step_down(free_qty, step_size) if step_size > ZERO else free_qty
+        qty_filters = self._quantity_filters_for_order(symbol_info, "MARKET")
+        min_qty, _max_qty, step_size = self._quantity_filter_bounds(qty_filters)
+        sell_qty = self._round_quantity_for_filters(free_qty, qty_filters)
         if sell_qty <= ZERO:
             raise BinanceDemoError(
                 f"После округления по stepSize доступное количество стало нулевым. {base_asset}: free={format_decimal(free_qty)}"
@@ -2880,6 +2902,8 @@ class App(tk.Tk):
             raise BinanceDemoError(
                 f"Свободный баланс меньше минимального MARKET_LOT_SIZE. {base_asset}: free={format_decimal(free_qty)}, rounded={format_decimal(sell_qty)}, minQty={format_decimal(min_qty)}"
             )
+
+        self._validate_quantity_filters(sell_qty, qty_filters, f"{base_asset} sell quantity")
 
         return format_decimal(sell_qty), base_asset, {
             "free_qty": free_qty,
